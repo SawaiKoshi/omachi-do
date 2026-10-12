@@ -1,0 +1,15 @@
+
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Original customer data
+*.xlsx
+*.xls
+*.csv
+
+# Environment variables
+.env
