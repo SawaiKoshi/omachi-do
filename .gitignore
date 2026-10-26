@@ -13,3 +13,24 @@ __pycache__/
 
 # Environment variables
 .env
+
+# Step 4: local reception history, SQLite journals and trusted model artifacts
+/var/
+/models/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.joblib
+*.pkl
+*.pickle
+.model-*
+
+# pytest scratch files
+.pytest_cache/
+
+# Local environment secrets
+.env.*
+!.env.example

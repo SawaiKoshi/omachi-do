@@ -1,0 +1,16 @@
+# Step 4: API・本人用モデル生成・合成テスト。LightGBMは配信に不要。
+# Step 1〜3の依存指定は変更しない。
+numpy==2.5.4
+pandas==3.0.6
+openpyxl==3.1.5
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+fastapi==0.162.0
+starlette==1.10.0
+pydantic==2.14.1
+uvicorn==0.54.0
+# TestClient用（実行時に外部HTTP通信はしない）
+httpx2==2.16.0
+httpcore2==2.16.0
+pytest==9.1.1
