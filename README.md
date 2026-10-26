@@ -372,3 +372,193 @@ SciPy 1.18.1 / joblib 1.6.0 / threadpoolctl 3.7.0 / LightGBM 4.7.0 / openpyxl 3.
 2026-10-27の最終テスト結果の文書反映後、同じpytestコマンドで **589 passed in 5.72s** を確認した。
 `git diff --check` も問題なし。今回の変更はREADMEとADR-0004だけで、実装・テストコードは変更していない。
 元Excelの読込、実データの最終テストの再実行、個人情報を含むデータの保存・Git追加は行っていない。
+
+## Step 4: ローカル受付管理・待ち時間予測API
+
+FastAPIとSQLiteでバックエンドを実装した。設計・状態遷移・保存理由・制約は
+[ADR-0005](docs/adr/ADR-0005.md)を参照。Web画面はStep 5で実装する。
+Step 1〜3の実装・テスト・評価結果は変更していない。
+この開発作業では元Excelの読込、実データ学習、正式モデル生成、外部公開を行っていない。
+
+### 環境構築と合成テスト
+
+既存のWSL仮想環境で、Step 4用の依存を追加する。`requirements-model.txt` は維持している。
+Step 4の配信にはLightGBMは不要。FastAPI 0.162.0 / Starlette 1.10.0 /
+Pydantic 2.14.1 / Uvicorn 0.54.0 / httpx2 2.16.0を使用する。
+モデルに関わる既存のscikit-learn・NumPy・pandas等は更新していない。
+
+```sh
+.venv/bin/python -m pip install -r requirements-api.txt
+.venv/bin/python -m pip check
+.venv/bin/python -m pytest -q -W error
+git diff --check
+```
+
+追加テストも合成データ・一時SQLite・一時モデルだけを使う。APIのテストではExcel読込を禁止し、
+HTTPはTestClient内で完結する。Starlette 1.10のTestClientにはhttpx2が必要。
+import時や`create_app()`呼出だけではDBを作らず、サーバーのlifespan開始時に初期化する。
+
+Step 4最終検証（2026-10-27）: `.venv/bin/python -m pytest -q -W error` → **780 passed in 9.63s**
+（既存589件＋追加191件）。合成モデルのHTTP予測・モデル版保存と実待ち分の分離も確認した。
+`git diff --check`・追加ファイルの空白チェック・`pip check`も問題なし。
+このCodex環境ではsandbox内のTestClientがイベントループ起動待ちになったため、
+全件テストは承認を得てsandbox外で実行した。WSLでのコマンドは上記と同じ。
+既存のStep 1〜3コード・テスト・ADR-0001〜0004・`requirements-model.txt`は変更していない。
+
+### 本人用の正式配信モデル生成（今回未実行）
+
+本人が入力・学習方針を確認してから、次のコマンドをWSLで明示実行する。
+`--confirm-full-training`・モデル版・Excelパスが揃わない場合はExcelを読まない。
+本人確認済みの **226候補・14営業日・2026-05-24〜2026-08-07・Excel1900方式** と照合し、
+一致した場合だけ全226件で再学習する。Step 3の最終テスト20件も配信用再学習に含めるが、
+再評価やモデル比較は行わず、Step 3の評価値も更新しない。
+このため、この配信用モデルの学習済みデータで改めて性能を主張しない。
+
+```sh
+.venv/bin/python step4_train_model.py --check-dependencies
+
+# 以下だけは本人による元Excelの読込・実データ学習を伴う。
+.venv/bin/python step4_train_model.py "/本人が管理する場所/対象ファイル.xlsx" \
+  --excel-date-system 1900 --confirm-full-training \
+  --model-version rf-step4-v1 --output-dir models
+```
+
+出力は `models/random-forest-rf-step4-v1.joblib`。同一バージョンは上書きできない。
+単一ファイル内に固定Random Forest、モデル版、10特徴量の順序、全パラメータ、seed=42、
+学習日時・件数・日付・目的変数定義・取得元、依存バージョン、前処理コードのSHA256を保存する。
+読み込み時はこれらを照合し、本人確認済みの全件再学習条件を満たすモデルだけ配信する。
+APIから学習処理を呼ぶ機能はない。追加のアンサンブルや自動再学習も行わない。
+
+joblibは読み込み時にコードを実行し得るため、**本人が生成・管理する信頼済みローカルファイルだけ**を
+`OMACHI_MODEL_PATH`に指定する。メタデータ・ハッシュの検証は、ファイルの安全性や出所を証明しない。
+モデルのアップロードやURL取得機能は設けない。モデル・DB・SQLiteジャーナルはGit対象外。
+
+### API起動
+
+モデル未配置でも受付できる。まず開発用DBで動作確認する。
+スタッフキーは次で生成し、起動用と動作確認用の両ターミナルで同じ値を環境変数へ設定する。
+このキーをお客様画面へ渡したり、Git・共有ログへ記録したりしない。
+
+```sh
+.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))'
+export OMACHI_STAFF_TOKEN='上で生成した値をここに設定'
+export OMACHI_DB_PATH="$PWD/var/dev-receptions.sqlite3"
+
+# 正式モデルを本人が生成した後だけ設定。未配置なら未設定のままでよい。
+# export OMACHI_MODEL_PATH="$PWD/models/random-forest-rf-step4-v1.joblib"
+
+.venv/bin/python -m uvicorn prediction_api:create_app --factory \
+  --host 127.0.0.1 --port 8000 --no-proxy-headers --no-access-log
+```
+
+DBは指定先の親ディレクトリごと自動作成する。スキーマ版1以外や未知の既存DBは自動変更せず拒否する。
+スタッフキーは32文字以上。未設定なら受付・予測は動くが、一覧・スタッフ操作は503になる。
+設定済みで認証なし・誤ったキーは401。接続元loopback・Host・同一Originを検証し、
+CORS、外部公開、リバースプロキシ、Swagger/ReDocのWeb画面は有効にしていない。
+キー認証はローカル試作向けであり、実店舗向けのアカウント・権限管理は未実装。
+
+### API契約と動作確認
+
+お客様のJSON本文は **`adults`と`children`の2項目だけ**。
+両方とも0以上の厳密な整数、合計1〜100人。文字列・真偽値・小数・余剰項目は422で拒否する。
+大人0人・子供1人も既存の人数判定に合わせて許可する。
+100人は新APIの技術的な入力上限で、店舗の収容人数や大人数の予測精度を表す値ではない。
+日時・曜日・番号・待ち組数はサーバーが自動取得し、手入力は受け付けない。
+
+| メソッド・パス | 用途 | 権限・補足 |
+| --- | --- | --- |
+| `GET /health` | API・DB・モデル配置状態 | モデル未配置でもAPI正常なら200。精度の保証ではない |
+| `POST /predict` | 登録しない参考予測と現在の待ち組集計 | 受付・採番・イベント・予測履歴を一切保存しない |
+| `POST /receptions` | 実受付・番号発行・スナップショット・予測保存 | `Idempotency-Key: <UUID>`必須。新規201・同一送信の再応答200 |
+| `GET /queue` | 未案内組の受付順一覧・人数・状態 | `X-Staff-Token`必須。お客様は`/predict`や自分の受付応答で集計を確認 |
+| `POST /receptions/{id}/seat` | 実際の案内完了 | スタッフ専用・本文なし。実待ち時間を確定 |
+| `POST /receptions/{id}/cancel` | キャンセル | スタッフ専用・本文なし |
+| `POST /receptions/{id}/call` | 呼び出し | スタッフ専用・本文なし。案内完了にはしない |
+| `POST /receptions/{id}/absent` | 呼び出し後の不在 | スタッフ専用・本文なし |
+| `POST /receptions/{id}/return` | 不在から待機へ戻す | スタッフ専用・本文なし。受付順は維持 |
+
+起動とは別のターミナルで実行する。以下の受付は開発用DBに保存される合成の動作確認記録となる。
+
+```sh
+export OMACHI_STAFF_TOKEN='起動ターミナルと同じキー'
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS -X POST http://127.0.0.1:8000/predict \
+  -H 'Content-Type: application/json' -d '{"adults":2,"children":0}'
+
+# UIでは送信操作ごとに自動生成し、成功応答が届くまで同じキーを使う。
+OMACHI_REQUEST_KEY="$(.venv/bin/python -c 'import uuid; print(uuid.uuid4())')"
+OMACHI_RECEIPT="$(curl -fsS -X POST http://127.0.0.1:8000/receptions \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $OMACHI_REQUEST_KEY" \
+  -d '{"adults":2,"children":0}')"
+printf '%s\n' "$OMACHI_RECEIPT"
+OMACHI_RECEPTION_ID="$(printf '%s' "$OMACHI_RECEIPT" | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+
+curl -fsS http://127.0.0.1:8000/queue -H "X-Staff-Token: $OMACHI_STAFF_TOKEN"
+curl -fsS -X POST "http://127.0.0.1:8000/receptions/$OMACHI_RECEPTION_ID/seat" \
+  -H "X-Staff-Token: $OMACHI_STAFF_TOKEN"
+```
+
+同じキー・人数の受付再送は、採番・推論・イベント追加をせず最初の受付応答を返す。
+後で案内済みになっていても再送応答は最初の状態であり、現在の未案内一覧は`/queue`で確認する。
+案内・取消の完了は各操作の応答で確認できる。完了履歴の取得APIは未実装。
+同じキーに異なる人数は409。別の受付には新しいキーを使い、同人数のお客様を誤って重複除外しない。
+存在しない受付は404、不正な状態遷移は409、DBのロック・保存失敗は503で成功扱いしない。
+通信・保存失敗からの再送も同じキーを保持する。
+
+### 自動記録と状態
+
+内部IDはUUID、表示番号はJST暦日ごとの `YYYYMMDD-001` 形式、受付順はDBの連番とする。
+別接続の同時受付も `BEGIN IMMEDIATE` 内で採番・集計・保存し、一意制約で重複を防ぐ。
+時刻はロック取得後に取得し、タイムゾーンなし・直前の記録より過去のシステム時刻は拒否する。
+初期構成では推論もこのトランザクション内で実行するため、混雑時はロック待ちが発生し得る。
+
+| 保存領域 | 主な記録 |
+| --- | --- |
+| `receptions` | ID・表示番号・受付順・受付日時・大人/子供/合計・状態・最新呼出時刻・案内/取消日時・実待ち分・取得元/記録時刻 |
+| `reception_snapshots` | 本人を除く受付直前の未案内総数・前方組数・同人数帯の前方組数・1〜2/3〜4/5名以上の組数・取得元/取得日時 |
+| `predictions` | 受付時の予測値または未取得理由・モデル版・注意文・判断日時・取得元。実績とは別保存 |
+| `reception_events` | 登録・呼出・不在・復帰・案内・取消と状態変更前後・発生/記録日時・操作元 |
+| `idempotency_keys` / `daily_counters` / `store_metadata` | 二重送信防止・日別採番・記録時刻整合性。DB版は`PRAGMA user_version`で管理 |
+
+`waiting`（待機）、`called`（呼出中）、`absent`（不在）は未案内として待ち組数に含める。
+`seated`（案内済み）、`cancelled`（取消済み）は除外する。
+全未案内状態から案内・取消が可能。待機→呼出、呼出→不在、不在→待機/再呼出を許可し、
+完了状態からの復帰は禁止する。同じ状態への再送は記録を増やさない。
+前日の未処理組は翌日も残し、自動で取消・案内済みにはしない。
+
+受付直前の総数と前方組数は初期仕様では同じ値になるが、混雑量と受付順の意味を分けて保存する。
+スナップショットは後の案内・取消・新規受付でも書き換えない。
+**受付順と案内順は別**で、後から来た2名組を先に案内できる。
+「人数や席の空き状況により、ご案内順が前後する場合があります」という注意文を返す。
+席の空き状況を取得しているという意味ではなく、現在は席・天気・予約等の推測値を保存しない。
+
+案内時だけ `(seated_at - received_at).total_seconds() / 60` を実待ち分として保存する。
+0分や秒を含む値も記録できる。呼出時刻からは計算せず、取消時は実待ち分を未確定のままにする。
+閉店後や日付をまたぐ実際の業務記録も残せるが、既存の同日・23:00以下という学習候補契約は変えない。
+新しい受付DB、特に待ち時間0分の記録は、現在のモデルへ自動的に混ぜない。
+
+### 予測の条件と次の工程
+
+待ち組数は保存と予測対象の判定に使うが、現在のRandom Forestの入力には増やさない。
+Xは既存Step 2の大人・子供・受付時刻（秒を含む分数）・曜日7列の順序付き10列だけ。
+サーバー日時をJSTへ変換して既存の`build_features()`を呼ぶ。
+
+| `prediction.status` | 数値を返す条件・意味 |
+| --- | --- |
+| `no_waiting_groups` | 本人を除く未案内組が0。予測はnull。即時案内・待ち時間0分を保証しない |
+| `unsupported_weekday` | 月〜木。通常平日の精度未検証のためnull |
+| `unsupported_time` | JSTで23:00を超える。既存前処理対象外のためnull |
+| `model_unavailable` | 対象条件は満たすがモデル未配置・不整合等。nullのまま受付可能 |
+| `prediction_failed` | 推論失敗・不正出力。nullのまま受付可能 |
+| `available` | 待ち組あり、金土日、23:00以下、正式条件のローカルモデル利用可能。生の有限・非負の回帰出力を参考値として返す |
+
+判定は上の対象外条件を先に確認し、モデル未配置と区別する。モデル版は推論を試行した場合に記録する。
+予測値を丸めたり、負値を0分へ補正したりしない。正確な待ち時間案内に十分な精度は未確認で、
+金曜日も学習候補2営業日・12件に限られる。`warnings`を画面に表示する必要がある。
+空席・天気・気温・祝日・学校休暇・予約情報の自動取得、モデル更新・保存データの学習用抽出、
+本格的な認証・権限管理、DB移行・バックアップ・保存期間設定、Web画面は今回実装していない。
+
+Step 5では、お客様の人数入力と受付完了画面、参考予測・待ち組数・案内順の注意表示、
+スタッフの一覧・呼出/不在/案内/取消操作、通信失敗時の同一キー再送、モデル未取得時の表示を用意する。
+お客様画面にはスタッフキーを渡さず、誤操作の確認方法、閉店時の未処理組の扱い、
+端末の時刻同期、許容誤差・表示方法を本人が確認してから運用へ進める。
