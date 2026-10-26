@@ -1,0 +1,4 @@
+# Step 3の4モデル比較の再現用（WSLで本人がLightGBM 4.7.0を導入・比較済み）。
+# 最終テスト専用CLIはRandomForestとDummyだけを使い、LightGBMをimportしない。
+scikit-learn==1.9.1
+lightgbm==4.7.0
