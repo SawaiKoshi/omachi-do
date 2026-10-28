@@ -12,7 +12,8 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -96,6 +97,22 @@ class QueueResponse(BaseModel):
     notice: str
 
 
+class PublicQueueGroup(BaseModel):
+    """お客様の待ち状況表示に必要な情報だけ。内部ID・履歴は公開しない。"""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+    display_number: str
+    total_people: int = Field(ge=1, le=100)
+    status: Literal["waiting", "called", "absent"]
+
+
+class PublicQueueResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    waiting_groups: int = Field(ge=0)
+    groups: list[PublicQueueGroup]
+    notice: str
+
+
 def create_app(
     *, db_path: str | Path | None = None, model_path: str | Path | None = None,
     staff_token: str | None = None, clock=None,
@@ -114,6 +131,9 @@ def create_app(
         yield
 
     app = FastAPI(title="おまちどう（ローカル開発用）", lifespan=lifespan, openapi_url=None)
+    web_directory = Path(__file__).resolve().parent / "web"
+    app.mount("/assets", StaticFiles(directory=web_directory / "static", check_dir=False),
+              name="customer-assets")
     app.add_middleware(
         TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"],
     )
@@ -146,6 +166,17 @@ def create_app(
             raise HTTPException(422, "操作の本文は不要です。日時はシステムが記録します。")
 
     staff_operations = [Depends(require_staff), Depends(require_no_body)]
+
+    @app.get("/", include_in_schema=False)
+    def customer_reception():
+        return FileResponse(web_directory / "index.html", headers={
+            "Content-Security-Policy": (
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self'; base-uri 'none'; "
+                "form-action 'self'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+        })
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request, error):
@@ -210,6 +241,18 @@ def create_app(
     def queue(request: Request):
         groups = request.app.state.store.get_queue()
         return {"waiting_groups": len(groups), "groups": groups, "notice": QUEUE_ORDER_NOTICE}
+
+    @app.get("/public/queue", response_model=PublicQueueResponse)
+    def public_queue(request: Request):
+        # 同じ読取結果から一覧と総数を作る。日付またぎの未案内受付も受付順で残す。
+        groups = request.app.state.store.get_queue()
+        public_groups = [
+            {"display_number": group["display_number"],
+             "total_people": group["total_people"], "status": group["status"]}
+            for group in groups
+        ]
+        return {"waiting_groups": len(public_groups), "groups": public_groups,
+                "notice": QUEUE_ORDER_NOTICE}
 
     def operation(reception_id: UUID, request: Request, target: str):
         return request.app.state.store.transition(str(reception_id), target)
