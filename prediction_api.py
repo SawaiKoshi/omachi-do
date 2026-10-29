@@ -22,6 +22,7 @@ from reception_store import (
     IdempotencyConflict, ReceptionNotFound, ReceptionStore, StateConflict,
     StoreBusy, StoreValidationError,
 )
+from staff_operation import MAX_REVISION, uuid_text
 
 
 class PartyInput(BaseModel):
@@ -78,6 +79,44 @@ class ReceptionResponse(BaseModel):
     actual_wait_minutes: float | None
     snapshot: QueueSnapshot
     prediction: PredictionOutput
+
+
+class StaffOperationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    operation_id: str
+    action: Literal["call", "absent", "return", "seat", "cancel"]
+    expected_revision: int = Field(ge=0, le=MAX_REVISION)
+    write_epoch: str
+
+    @model_validator(mode="after")
+    def normalize_identifiers(self):
+        self.operation_id = uuid_text(self.operation_id)
+        self.write_epoch = uuid_text(self.write_epoch)
+        return self
+
+
+class StaffReceptionResponse(BaseModel):
+    reception: ReceptionResponse
+    revision: int
+    write_epoch: str
+    staff_write_mode: Literal["legacy", "revision_required"]
+
+
+class StaffOperationError(BaseModel):
+    code: str
+    detail: str
+
+
+class StaffOperationResponse(BaseModel):
+    operation_id: str
+    reception_id: str
+    action: Literal["call", "absent", "return", "seat", "cancel"]
+    outcome: Literal["state_changed", "no_change", "rejected"]
+    response_status: int
+    recorded_at: str
+    resulting_revision: int | None
+    reception: ReceptionResponse | None
+    error: StaffOperationError | None
 
 
 class QueueGroup(BaseModel):
@@ -160,6 +199,9 @@ def create_app(
             raise HTTPException(503, "スタッフ操作は未設定です。OMACHI_STAFF_TOKENを設定してください。")
         if x_staff_token is None or not hmac.compare_digest(x_staff_token.encode(), token.encode()):
             raise HTTPException(401, "スタッフ認証が必要です。")
+        # This credential authenticates the shared staff role, not an individual.
+        # Neither the token nor a token-derived fingerprint enters the ledger.
+        return {"principal_kind": "shared_staff_token", "principal_id": "shared-staff"}
 
     async def require_no_body(request: Request):
         if await request.body():
@@ -253,6 +295,28 @@ def create_app(
         ]
         return {"waiting_groups": len(public_groups), "groups": public_groups,
                 "notice": QUEUE_ORDER_NOTICE}
+
+    @app.get("/staff/receptions/{reception_id}", response_model=StaffReceptionResponse,
+             dependencies=[Depends(require_staff)])
+    def staff_reception(reception_id: UUID, request: Request):
+        return request.app.state.store.get_staff_reception(str(reception_id))
+
+    @app.post("/staff/receptions/{reception_id}/operations", response_model=StaffOperationResponse)
+    def protected_operation(reception_id: UUID, command: StaffOperationInput, request: Request,
+                            principal: Annotated[dict, Depends(require_staff)]):
+        result = request.app.state.store.staff_transition(
+            str(reception_id), command.action, operation_id=command.operation_id,
+            expected_revision=command.expected_revision, write_epoch=command.write_epoch, **principal,
+        )
+        # Validate and filter even persisted responses before returning them.
+        body = StaffOperationResponse.model_validate(result).model_dump(mode="json")
+        return JSONResponse(status_code=result["response_status"], content=body)
+
+    @app.get("/staff/operations/{operation_id}", response_model=StaffOperationResponse)
+    def staff_operation_result(operation_id: UUID, request: Request,
+                               principal: Annotated[dict, Depends(require_staff)]):
+        # Lookup itself is 200; response_status describes the original command.
+        return request.app.state.store.get_staff_operation(str(operation_id), **principal)
 
     def operation(reception_id: UUID, request: Request, target: str):
         return request.app.state.store.transition(str(reception_id), target)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
+from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -17,7 +18,11 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from reception_schema import (
-    STATE_FIELDS, SchemaValidationError, validate_history, validate_schema,
+    ALLOWED_TRANSITIONS, STATE_FIELDS, SchemaValidationError, validate_history, validate_schema,
+)
+from staff_operation import (
+    ACTION_TARGETS, REQUEST_VERSION, canonical_json, command_request, receipt_response,
+    saved_response, uuid_text, validate_principal,
 )
 
 
@@ -445,7 +450,8 @@ class ReceptionStore:
                            (reception_id,)).fetchone()
         return dict(row)
 
-    def _append_event(self, conn, reception_id, kind, previous, target, timestamp, source, *, before=None):
+    def _append_event(self, conn, reception_id, kind, previous, target, timestamp, source, *, before=None,
+                      operation_id=None):
         if self.schema_version == 1:
             conn.execute(
                 "INSERT INTO reception_events(reception_id, event_type, from_status, to_status, "
@@ -457,21 +463,57 @@ class ReceptionStore:
             conn.execute(
                 "INSERT INTO reception_events(reception_id, event_type, from_status, to_status, "
                 "occurred_at, recorded_at, source, audit_kind, revision_before, revision_after, "
-                "before_state_json, after_state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "before_state_json, after_state_json, operation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (reception_id, kind, previous, target, timestamp, timestamp, source,
-                 "registration_v2" if kind == "registered" else "staff_legacy_v2",
+                 "registration_v2" if kind == "registered" else ("staff_v2" if operation_id else "staff_legacy_v2"),
                  before["revision"] if before is not None else None, after["revision"],
-                 _json(before) if before is not None else None, _json(after)),
+                 _json(before) if before is not None else None, _json(after), operation_id),
             )
+
+    def _checked_state(self, conn, reception_id):
+        before = self._audit_state(conn, reception_id)
+        event = conn.execute("SELECT to_status,revision_after,after_state_json FROM reception_events "
+                             "WHERE reception_id=? ORDER BY event_id DESC LIMIT 1", (reception_id,)).fetchone()
+        if (event is None or event["to_status"] != before["status"]
+                or (event["revision_after"] or 0) != before["revision"]
+                or (event["after_state_json"] is not None
+                    and json.loads(event["after_state_json"]) != before)):
+            raise StoreValidationError("現在状態と監査履歴が一致しません。")
+        return before
+
+    def _transition_record(self, conn, record, target, before, timestamp, *, operation_id=None):
+        # Shared by legacy/protected paths: intake time, snapshots and predictions
+        # never change. Calling is not actual seating.
+        reception_id = record["id"]
+        now = datetime.fromisoformat(timestamp)
+        received = datetime.fromisoformat(record["received_at"])
+        if now < received:
+            raise StoreValidationError("操作時刻が受付時刻より前です。")
+        called_at = timestamp if target == "called" else record["called_at"]
+        seated_at = timestamp if target == "seated" else None
+        cancelled_at = timestamp if target == "cancelled" else None
+        wait = (now - received).total_seconds() / 60 if target == "seated" else None
+        revision_sql = ", revision = revision + 1" if before is not None else ""
+        revision_where = " AND revision = ?" if before is not None else ""
+        parameters = (target, called_at, seated_at, cancelled_at, wait, reception_id)
+        if before is not None:
+            parameters += (before["revision"],)
+        updated = conn.execute(
+            "UPDATE receptions SET status = ?, called_at = ?, seated_at = ?, cancelled_at = ?, "
+            "actual_wait_minutes = ?" + revision_sql + " WHERE id = ?" + revision_where,
+            parameters,
+        )
+        if updated.rowcount != 1:
+            raise StateConflict("受付の更新版が変わりました。")
+        arguments = dict(before=before)
+        if operation_id is not None:
+            arguments["operation_id"] = operation_id
+        self._append_event(conn, reception_id, target, record["status"], target, timestamp,
+                           "staff_operation", **arguments)
+        return self._get(conn, reception_id)
 
     def transition(self, reception_id: str, target: str) -> dict:
         """Record a staff action; calling is never treated as actual seating."""
-        allowed = {
-            "waiting": {"called", "seated", "cancelled"},
-            "called": {"absent", "seated", "cancelled"},
-            "absent": {"waiting", "called", "seated", "cancelled"},
-            "seated": set(), "cancelled": set(),
-        }
         with self._connection(write=True) as conn:
             if self.schema_version == 2:
                 mode = conn.execute("SELECT staff_write_mode FROM store_metadata WHERE singleton = 1").fetchone()[0]
@@ -482,38 +524,111 @@ class ReceptionStore:
             if record is None:
                 raise ReceptionNotFound(reception_id)
             previous = record["status"]
-            before = self._audit_state(conn, reception_id) if self.schema_version == 2 else None
-            if before is not None:
-                event = conn.execute("SELECT to_status,revision_after FROM reception_events "
-                                     "WHERE reception_id=? ORDER BY event_id DESC LIMIT 1", (reception_id,)).fetchone()
-                if (event is None or event["to_status"] != previous
-                        or (event["revision_after"] or 0) != before["revision"]):
-                    raise StoreValidationError("現在状態と監査履歴が一致しません。")
+            before = self._checked_state(conn, reception_id) if self.schema_version == 2 else None
             if target == previous:
                 return record
-            if target not in allowed[previous]:
+            if target not in ALLOWED_TRANSITIONS[previous]:
                 raise StateConflict(f"{previous} から {target} への状態変更はできません。")
-            now = self._now(conn, persist=True)
-            received = datetime.fromisoformat(record["received_at"])
-            if now < received:
-                raise StoreValidationError("操作時刻が受付時刻より前です。")
-            timestamp = now.isoformat()
-            called_at = timestamp if target == "called" else record["called_at"]
-            seated_at = timestamp if target == "seated" else None
-            cancelled_at = timestamp if target == "cancelled" else None
-            wait = (now - received).total_seconds() / 60 if target == "seated" else None
-            revision_sql = ", revision = revision + 1" if before is not None else ""
-            revision_where = " AND revision = ?" if before is not None else ""
-            parameters = (target, called_at, seated_at, cancelled_at, wait, reception_id)
-            if before is not None:
-                parameters += (before["revision"],)
-            updated = conn.execute(
-                "UPDATE receptions SET status = ?, called_at = ?, seated_at = ?, cancelled_at = ?, "
-                "actual_wait_minutes = ?" + revision_sql + " WHERE id = ?" + revision_where,
-                parameters,
-            )
-            if updated.rowcount != 1:
-                raise StateConflict("受付の更新版が変わりました。")
-            self._append_event(conn, reception_id, target, previous, target, timestamp,
-                               "staff_operation", before=before)
-            return self._get(conn, reception_id)
+            return self._transition_record(conn, record, target, before, self._now(conn, persist=True).isoformat())
+
+    def _require_staff_v2(self):
+        if self.schema_version != 2:
+            raise StateConflict("保護付きスタッフ操作には明示的に移行したv2 DBが必要です。")
+
+    def get_staff_reception(self, reception_id):
+        self._require_staff_v2()
+        with self._connection() as conn:
+            record = self._get(conn, reception_id)
+            if record is None:
+                raise ReceptionNotFound(reception_id)
+            before = self._checked_state(conn, reception_id)
+            metadata = conn.execute("SELECT write_epoch,staff_write_mode FROM store_metadata").fetchone()
+            return dict(reception=receipt_response(record), revision=before["revision"],
+                        write_epoch=metadata["write_epoch"], staff_write_mode=metadata["staff_write_mode"])
+
+    @staticmethod
+    def _saved_staff_response(operation):
+        try:
+            return saved_response(operation)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise StoreValidationError("スタッフ操作記録が不整合です。") from exc
+
+    def get_staff_operation(self, operation_id, *, principal_kind, principal_id):
+        self._require_staff_v2()
+        try:
+            operation_id = uuid_text(operation_id)
+            validate_principal(principal_kind, principal_id)
+        except (ValueError, TypeError) as exc:
+            raise StoreValidationError("操作IDまたは認証主体が不正です。") from exc
+        with self._connection() as conn:
+            operation = conn.execute("SELECT * FROM staff_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if (operation is None or operation["principal_kind"] != principal_kind
+                    or operation["principal_id"] != principal_id):
+                raise ReceptionNotFound(operation_id)
+            return self._saved_staff_response(operation)
+
+    @staticmethod
+    def _save_staff_operation(conn, operation):
+        conn.execute("INSERT INTO staff_operations(" + ",".join(operation) + ") VALUES(" +
+                     ",".join("?" for _ in operation) + ")", tuple(operation.values()))
+
+    def staff_transition(self, reception_id, action, *, operation_id, expected_revision,
+                         write_epoch, principal_kind, principal_id):
+        """Atomically claim a command and archive its result, including business rejections.
+
+        An existing command is replayed before checking today's revision/epoch.
+        Its archived result describes that command, not the current reception.
+        Credentials must never be supplied as principal IDs by transport adapters.
+        """
+        self._require_staff_v2()
+        try:
+            operation_id = uuid_text(operation_id)
+            command = command_request(reception_id, action, expected_revision, write_epoch)
+            validate_principal(principal_kind, principal_id)
+        except (ValueError, TypeError) as exc:
+            raise StoreValidationError("スタッフ操作の要求が不正です。") from exc
+        reception_id, write_epoch = command["reception_id"], command["write_epoch"]
+        request_json = canonical_json(command)
+        digest = sha256(request_json.encode()).hexdigest()
+        with self._connection(write=True) as conn:
+            existing = conn.execute("SELECT * FROM staff_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if existing is not None:
+                if (existing["principal_kind"] != principal_kind or existing["principal_id"] != principal_id
+                        or existing["request_json"] != request_json or existing["request_sha256"] != digest):
+                    raise StateConflict("操作IDが別の要求または認証主体で使用されています。")
+                return self._saved_staff_response(existing)
+            metadata = conn.execute("SELECT write_epoch FROM store_metadata").fetchone()
+            record = self._get(conn, reception_id)
+            before = self._checked_state(conn, reception_id) if record is not None else None
+            error, status = None, 200
+            # Epoch validation also applies to commands for a missing reception.
+            if write_epoch != metadata["write_epoch"]:
+                error, status = dict(code="write_epoch_conflict", detail="書込み世代が変わりました。最新情報を取得してください。"), 409
+            elif record is None:
+                error, status = dict(code="reception_not_found", detail="受付が見つかりません。"), 404
+            elif before["revision"] != expected_revision:
+                error, status = dict(code="revision_conflict", detail="受付が更新されています。最新情報を取得してください。"), 409
+            target = ACTION_TARGETS[action]
+            if error is None and record["status"] != target and target not in ALLOWED_TRANSITIONS[record["status"]]:
+                error, status = dict(code="state_conflict", detail="この状態から操作できません。"), 409
+            timestamp = self._now(conn, persist=True).isoformat()
+            outcome = "rejected" if error else "no_change"
+            if error is None and record["status"] != target:
+                record = self._transition_record(conn, record, target, before, timestamp, operation_id=operation_id)
+                outcome = "state_changed"
+            revision = None if before is None else before["revision"] + (outcome == "state_changed")
+            response = dict(operation_id=operation_id, reception_id=reception_id, action=action,
+                            outcome=outcome, response_status=status, recorded_at=timestamp,
+                            resulting_revision=revision, reception=receipt_response(record) if not error else None,
+                            error=error)
+            operation = dict(operation_id=operation_id, request_schema_version=REQUEST_VERSION,
+                             requested_reception_id=reception_id,
+                             resolved_reception_id=reception_id if record is not None else None,
+                             action=action, write_epoch=write_epoch, expected_revision=expected_revision,
+                             principal_kind=principal_kind, principal_id=principal_id,
+                             request_json=request_json, request_sha256=digest, outcome=outcome,
+                             response_status=status, response_json=canonical_json(response),
+                             resulting_revision=revision, recorded_at=timestamp)
+            self._saved_staff_response(operation)
+            self._save_staff_operation(conn, operation)
+            return response

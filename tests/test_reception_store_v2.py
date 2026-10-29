@@ -21,6 +21,7 @@ from reception_migration.schema import TRIGGERS
 from reception_migration.synthetic import BASE, create_v1
 from reception_schema import STATE_FIELDS, validate_history, validate_schema
 from reception_store import ReceptionStore, StateConflict, StoreValidationError
+from staff_operation import canonical_json, command_request, receipt_response
 
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -428,6 +429,13 @@ def test_staff_operation_structure_must_agree_with_its_audit_event(pair, fault):
                          request_json="{}", request_sha256=sha256(b"{}").hexdigest(),
                          outcome="state_changed", response_status=200, response_json="{}",
                          resulting_revision=1, recorded_at=Clock()().isoformat())
+        operation["request_json"] = canonical_json(command_request(receipt["id"], "call", 0, epoch))
+        operation["request_sha256"] = sha256(operation["request_json"].encode()).hexdigest()
+        operation["response_json"] = canonical_json(dict(
+            operation_id=operation["operation_id"], reception_id=receipt["id"], action="call",
+            outcome="state_changed", response_status=200, recorded_at=operation["recorded_at"],
+            resulting_revision=1, reception=receipt_response(store.get(receipt["id"])), error=None,
+        ))
         if fault == "action":
             operation["action"] = "seat"
         elif fault == "expected_revision":

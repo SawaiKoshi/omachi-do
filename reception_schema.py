@@ -11,6 +11,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from reception_migration.schema import expected_signature, signature
+from staff_operation import RECEIPT_FIELDS, saved_response
 
 
 class SchemaValidationError(ValueError):
@@ -164,6 +165,7 @@ def validate_history(conn, version):
     migration = None
     operations = {}
     audited_operations = set()
+    revision_states = {}
     if version == 2:
         migration = rows(conn, "SELECT legacy_max_event_id,legacy_event_sequence,"
                          "legacy_reception_sequence FROM schema_migrations")[0]
@@ -248,11 +250,42 @@ def validate_history(conn, version):
                         raise SchemaValidationError("Staff operation does not match its audited state change.")
                     audited_operations.add(event["operation_id"])
         states[rid] = state
+        revision_states[rid, state["revision"]] = (dict(state), recorded)
     if set(states) != set(receptions):
         raise SchemaValidationError("Missing registration history.")
     if any(operation["outcome"] == "state_changed" and operation_id not in audited_operations
            for operation_id, operation in operations.items()):
         raise SchemaValidationError("Staff operation claims a state change without an audit event.")
+    for operation in operations.values():
+        try:
+            response = saved_response(operation)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise SchemaValidationError("Invalid archived staff request or response.") from exc
+        recorded = timestamp(operation["recorded_at"])
+        if last is None or recorded > last:
+            raise SchemaValidationError("Staff operation clock exceeds the store clock.")
+        rid, revision = operation["resolved_reception_id"], operation["resulting_revision"]
+        if rid is not None:
+            if rid not in receptions or revision is None or revision > receptions[rid]["revision"]:
+                raise SchemaValidationError("Invalid staff operation reception/revision.")
+            if recorded < timestamp(receptions[rid]["received_at"]):
+                raise SchemaValidationError("Staff operation predates the reception.")
+            historical, changed_at = revision_states.get((rid, revision), (None, None))
+            next_state = revision_states.get((rid, revision + 1))
+            if (historical is None or recorded < changed_at
+                    or (next_state is not None and recorded > next_state[1])):
+                raise SchemaValidationError("Staff operation clock does not match its result revision.")
+        if operation["outcome"] in ("state_changed", "no_change"):
+            historical, changed_at = revision_states.get((rid, revision), (None, None))
+            receipt = response["reception"]
+            if (historical is None or recorded < changed_at
+                    or not _same_state({**{name: receipt[name] for name in STATE_FIELDS if name != "revision"},
+                                        "revision": revision}, historical)):
+                raise SchemaValidationError("Archived staff result disagrees with historical state.")
+            initial = _object(keys[rid]["response_json"])
+            if any(receipt[name] != initial[name] for name in RECEIPT_FIELDS
+                   if name not in STATE_FIELDS):
+                raise SchemaValidationError("Archived staff result changed immutable intake data.")
     for rid, state in states.items():
         projection = {name: receptions[rid][name] for name in STATE_FIELDS if name != "revision"}
         projection["revision"] = receptions[rid].get("revision", 0)
