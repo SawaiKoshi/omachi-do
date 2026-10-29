@@ -3,13 +3,17 @@
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
-import math
 from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
+from reception_schema import (
+    SchemaValidationError, integrity as check_integrity,
+    validate_history, validate_schema as validate_database_schema,
+)
+
 from .safety import SafetyError, Workspace
-from .schema import TRIGGERS, expected_signature, rebuild_tables, signature
+from .schema import TRIGGERS, rebuild_tables
 
 
 class MigrationError(ValueError):
@@ -59,102 +63,30 @@ def legacy_manifest(conn, columns=None):
         rows = [tuple(_cell(row[i],row[i+1]) for i in range(0,len(row),2))
                 for row in conn.execute(f'SELECT {selection} FROM {_quoted(table)}')]
         result[table] = {'columns': names, 'rows': sorted(rows,key=json_text)}
-    result['sqlite_sequence'] = tuple(conn.execute(
+    result['sqlite_sequence'] = tuple(tuple(row) for row in conn.execute(
         "SELECT name,seq,typeof(seq) FROM sqlite_sequence WHERE name IN ('receptions','reception_events') ORDER BY name"))
     return result
 
 
 def integrity(conn):
-    if conn.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
-        raise MigrationError('SQLite integrity_check failed.')
-    if conn.execute('PRAGMA foreign_key_check').fetchall():
-        raise MigrationError('Foreign-key violations; migration does not repair data.')
+    try:
+        return check_integrity(conn)
+    except SchemaValidationError as exc:
+        raise MigrationError(str(exc)) from exc
 
 
 def validate_schema(conn, version):
-    if conn.execute('PRAGMA user_version').fetchone()[0] != version:
-        raise MigrationError(f'Expected schema v{version}; no automatic migration.')
-    if signature(conn) != expected_signature(version):
-        raise MigrationError('Incomplete or unexpected schema, constraints, indexes, or triggers.')
-    integrity(conn)
-    if version == 2:
-        rows = conn.execute('SELECT singleton,database_id,write_epoch,staff_write_mode,'
-                            'seat_corrections_enabled FROM store_metadata').fetchall()
-        if len(rows) != 1 or rows[0][0] != 1:
-            raise MigrationError('Invalid store metadata.')
-        from uuid import UUID
-        try:
-            for value in rows[0][1:3]:
-                if str(UUID(value)) != value or UUID(value).int == 0:
-                    raise ValueError
-        except (ValueError,TypeError,AttributeError) as exc:
-            raise MigrationError('Invalid database identity or write epoch.') from exc
-        if rows[0][3:] != ('legacy',0):
-            raise MigrationError('This laboratory only accepts disabled corrections in legacy mode.')
-        if conn.execute('SELECT COUNT(*) FROM schema_migrations WHERE version=2 AND from_version=1').fetchone()[0] != 1:
-            raise MigrationError('Missing v1 -> v2 migration provenance.')
-
-
-def _time(value):
     try:
-        parsed = datetime.fromisoformat(value)
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError
-        return parsed
-    except (TypeError,ValueError) as exc:
-        raise MigrationError('Missing or invalid timezone-aware historical timestamp.') from exc
+        return validate_database_schema(conn, version)
+    except SchemaValidationError as exc:
+        raise MigrationError(str(exc)) from exc
 
 
 def validate_v1_history(conn):
-    rows = conn.execute('SELECT singleton,last_recorded_at FROM store_metadata').fetchall()
-    if len(rows) != 1 or rows[0][0] != 1:
-        raise MigrationError('Missing singleton metadata.')
-    last = _time(rows[0][1]) if rows[0][1] is not None else None
-    allowed = {'waiting': {'called','seated','cancelled'},
-               'called': {'absent','seated','cancelled'},
-               'absent': {'waiting','called','seated','cancelled'},
-               'seated': set(), 'cancelled': set()}
-    states = {}
-    for event_id, rid, kind, before, after, occurred, recorded in conn.execute(
-            'SELECT event_id,reception_id,event_type,from_status,to_status,occurred_at,recorded_at '
-            'FROM reception_events ORDER BY event_id'):
-        if kind == 'registered':
-            if rid in states or before is not None or after != 'waiting':
-                raise MigrationError('Invalid registration event chain.')
-        elif (rid not in states or states[rid] != before or kind != after
-              or after not in allowed.get(before,set())):
-            raise MigrationError('Invalid historical state transition.')
-        if _time(recorded) < _time(occurred) or last is None or _time(recorded) > last:
-            raise MigrationError('Historical event clock is inconsistent.')
-        states[rid] = after
-    for rid, status, received, seated, actual, recorded in conn.execute(
-            'SELECT id,status,received_at,seated_at,actual_wait_minutes,recorded_at FROM receptions'):
-        if states.get(rid) != status:
-            raise MigrationError('Current status does not match the last event.')
-        if last is None or _time(received) > last or _time(recorded) < _time(received):
-            raise MigrationError('Reception clock is inconsistent.')
-        if status == 'seated':
-            expected = (_time(seated)-_time(received)).total_seconds()/60
-            if not math.isfinite(actual) or not math.isclose(actual,expected,rel_tol=1e-12,abs_tol=1e-9):
-                raise MigrationError('Actual wait does not match the original timestamps.')
-        for table in ('reception_snapshots','predictions','idempotency_keys'):
-            if conn.execute(f'SELECT COUNT(*) FROM {table} WHERE reception_id=?',(rid,)).fetchone()[0] != 1:
-                raise MigrationError('Missing one-to-one intake data.')
-    for table in ('reception_snapshots','predictions','idempotency_keys'):
-        if conn.execute(f'SELECT COUNT(*) FROM {table} WHERE reception_id IS NULL').fetchone()[0]:
-            raise MigrationError('NULL legacy primary/foreign key.')
-    if conn.execute('SELECT COUNT(*) FROM idempotency_keys WHERE key IS NULL').fetchone()[0]:
-        raise MigrationError('NULL legacy idempotency key.')
-    for table, column in (('receptions','reception_order'),('reception_events','event_id')):
-        maximum = conn.execute(f'SELECT COALESCE(MAX({column}),0) FROM {table}').fetchone()[0]
-        sequence = conn.execute('SELECT seq FROM sqlite_sequence WHERE name=?',(table,)).fetchone()
-        if maximum and (sequence is None or type(sequence[0]) is not int or sequence[0]<maximum):
-            raise MigrationError('Invalid historical AUTOINCREMENT high-water mark.')
-    for number, received in conn.execute('SELECT display_number,received_at FROM receptions'):
-        day, suffix = number.rsplit('-',1)
-        counter = conn.execute('SELECT last_number FROM daily_counters WHERE reception_date=?',(day,)).fetchone()
-        if not suffix.isdecimal() or counter is None or counter[0]<int(suffix):
-            raise MigrationError('Daily reception counter is inconsistent.')
+    try:
+        return validate_history(conn, 1)
+    except SchemaValidationError as exc:
+        raise MigrationError(str(exc)) from exc
 
 
 def inspect_database(workspace, path, *, version, recovery=False):
@@ -215,6 +147,7 @@ def migrate(workspace: Workspace, path, *, expected_sha256, checkpoint=lambda st
             checkpoint('preservation_verified')
             code = b''.join(Path(__file__).with_name(name).read_bytes()
                             for name in ('migration.py','schema.py','v1_schema.py','safety.py'))
+            code += Path(__file__).parents[1].joinpath('reception_schema.py').read_bytes()
             conn.execute('INSERT INTO schema_migrations VALUES (2,?,1,?,?,?,?,?,?)',
                          (str(uuid4()),datetime.now(timezone.utc).isoformat(),sha256(code).hexdigest(),
                           source_digest,max_event,sequences.get('reception_events',0),sequences.get('receptions',0)))

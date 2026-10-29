@@ -1,4 +1,7 @@
-"""v2 DDL for the synthetic migration laboratory, not the application's schema."""
+"""Known schema contracts shared by runtime checks and the synthetic migration lab.
+
+Runtime signature references are built in memory; file migration remains explicit.
+"""
 
 from functools import lru_cache
 import re
@@ -296,7 +299,12 @@ TRIGGERS = tuple(TRIGGERS)
 
 
 def signature(conn):
-    return tuple((kind, name, table, re.sub(r'\s+', ' ', sql).strip() if sql else None)
+    def normalize(sql):
+        # Whitespace inside quoted SQL values/identifiers is significant.
+        pieces = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")", sql)
+        return ''.join(piece if index % 2 else re.sub(r'\s+', ' ', piece)
+                       for index, piece in enumerate(pieces)).strip()
+    return tuple((kind, name, table, normalize(sql) if sql else None)
                  for kind, name, table, sql in conn.execute(
                      "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name"))
 

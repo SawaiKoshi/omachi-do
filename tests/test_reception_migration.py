@@ -211,7 +211,7 @@ def test_double_migration_and_code_version_mismatches_refuse_without_writes(lab)
         run_migration(lab,path)
     assert path.read_bytes()==migrated
     with pytest.raises(StoreValidationError):
-        ReceptionStore(path)
+        ReceptionStore(path, expected_schema_version=1)
     assert path.read_bytes()==migrated
 
 

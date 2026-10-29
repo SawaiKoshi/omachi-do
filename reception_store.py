@@ -16,9 +16,14 @@ from typing import Callable
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+from reception_schema import (
+    STATE_FIELDS, SchemaValidationError, validate_history, validate_schema,
+)
+
 
 JST = ZoneInfo("Asia/Tokyo")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 1  # New databases remain v1; existing v2 requires explicit migration.
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 ACTIVE_STATUSES = ("waiting", "called", "absent")
 _PREDICTION_STATUSES = {
     "available", "model_unavailable", "no_waiting_groups",
@@ -154,29 +159,52 @@ def _size_band(total_people: int) -> str:
 class ReceptionStore:
     """A file-backed SQLite store, initialized and schema-checked on construction.
 
-    Version 1 databases are reopened; other/nonempty unknown schemas are rejected.
+    Known v1 and migrated v2 schemas are strictly checked; neither is migrated.
+    A store instance stays bound to its initially validated version. Optional
+    expected_schema_version rejects accidental connections to another version.
     Timestamps are generated internally, stored with their JST offset, and never
     accepted as customer-supplied intake or seating times. Pending records remain
     active across midnight until a staff operation resolves them.
     """
 
-    def __init__(self, db_path: str | Path, clock: Callable[[], datetime] | None = None):
+    def __init__(self, db_path: str | Path, clock: Callable[[], datetime] | None = None,
+                 *, expected_schema_version: int | None = None):
         if str(db_path) == ":memory:":
             raise StoreValidationError("独立した接続間で共有できるSQLiteファイルを指定してください。")
-        self.db_path = Path(db_path)
+        if (expected_schema_version is not None and
+                (type(expected_schema_version) is not int or expected_schema_version not in SUPPORTED_SCHEMA_VERSIONS)):
+            raise StoreValidationError("対応するDBスキーマ版は1または2です。")
+        self.db_path = Path(db_path).absolute()
+        self._schema_version = expected_schema_version
+        self._database_identity = None
         self.clock = clock if clock is not None else lambda: datetime.now(JST)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
+
+    @property
+    def schema_version(self):
+        return self._schema_version
 
     @contextmanager
     def _connection(self, *, write: bool = False):
-        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        mode = "rw" if write else "ro"
+        conn = sqlite3.connect(self.db_path.as_uri() + f"?mode={mode}", uri=True,
+                               timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            # Check before any business DML, within the same transaction/lock.
+            validate_schema(conn, self.schema_version, check_integrity=False,
+                            allow_revision_required=True)
+            if self.schema_version == 2:
+                identity = tuple(conn.execute("SELECT database_id,write_epoch FROM store_metadata").fetchone())
+                if identity != self._database_identity:
+                    raise SchemaValidationError("Database identity or write epoch changed; reopen the store.")
             yield conn
             conn.commit()
+        except SchemaValidationError as exc:
+            conn.rollback()
+            raise StoreValidationError("DBスキーマまたは設定が不正です。自動修復は行いません。") from exc
         except sqlite3.OperationalError as exc:
             conn.rollback()
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
@@ -189,20 +217,48 @@ class ReceptionStore:
             conn.close()
 
     def initialize(self) -> None:
-        with self._connection(write=True) as conn:
+        new_file = not self.db_path.exists()
+        if not new_file and self.db_path.stat().st_size == 0:
+            raise StoreValidationError("既存DBが空です。自動初期化は行いません。")
+        if new_file and self.schema_version == 2:
+            raise StoreValidationError("v2の新規作成・自動移行は行いません。移行済みDBを指定してください。")
+        if new_file:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "rwc" if new_file else "ro"
+        conn = sqlite3.connect(self.db_path.as_uri() + f"?mode={mode}", uri=True,
+                               timeout=10, isolation_level=None)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE" if new_file else "BEGIN")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if not tables and version == 0:
+            if new_file and version == 0:
+                if conn.execute("SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'").fetchone():
+                    raise SchemaValidationError("Unknown unversioned database.")
                 for statement in _SCHEMA:
                     conn.execute(statement)
                 conn.execute("INSERT INTO store_metadata(singleton) VALUES (1)")
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            elif version != SCHEMA_VERSION or tables != _TABLES:
-                raise StoreValidationError("未対応のDBスキーマです。自動移行は行いません。")
+                version = SCHEMA_VERSION
+            expected = self.schema_version if self.schema_version is not None else version
+            validate_schema(conn, expected, allow_revision_required=True)
+            validate_history(conn, expected)
+            identity = tuple(conn.execute("SELECT database_id,write_epoch FROM store_metadata").fetchone()) if expected == 2 else None
+            if self._database_identity is not None and identity != self._database_identity:
+                raise SchemaValidationError("Database identity or write epoch changed; recreate the store.")
+            if new_file:
+                conn.commit()
+            else:
+                conn.rollback()
+            self._schema_version = expected
+            self._database_identity = identity
+        except SchemaValidationError as exc:
+            conn.rollback()
+            raise StoreValidationError("未対応または不整合のDBです。自動移行・自動修復は行いません。") from exc
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _now(self, conn: sqlite3.Connection, *, persist: bool = False) -> datetime:
         value = self.clock()
@@ -333,11 +389,7 @@ class ReceptionStore:
             prediction = self._prediction(predictor, adults, children, now, snap["waiting_groups"])
             conn.execute("INSERT INTO predictions VALUES (?, ?, ?, ?)",
                          (reception_id, timestamp, "local_prediction_service", _json(prediction)))
-            conn.execute(
-                "INSERT INTO reception_events(reception_id, event_type, from_status, to_status, "
-                "occurred_at, recorded_at, source) VALUES (?, 'registered', NULL, 'waiting', ?, ?, ?)",
-                (reception_id, timestamp, timestamp, "reception_api"),
-            )
+            self._append_event(conn, reception_id, "registered", None, "waiting", timestamp, "reception_api")
             response = self._get(conn, reception_id)
             conn.execute("INSERT INTO idempotency_keys VALUES (?, ?, ?, ?, ?)",
                          (key, reception_id, adults, children, _json(response)))
@@ -349,6 +401,9 @@ class ReceptionStore:
         if row is None:
             return None
         result = dict(row)
+        # Internal concurrency metadata must not change the original receipt or
+        # the initial idempotent response, even before HTTP response filtering.
+        result.pop("revision", None)
         snap = conn.execute("SELECT * FROM reception_snapshots WHERE reception_id = ?",
                             (reception_id,)).fetchone()
         result["snapshot"] = {
@@ -384,6 +439,31 @@ class ReceptionStore:
                 (reception_id,),
             )]
 
+    @staticmethod
+    def _audit_state(conn, reception_id: str) -> dict:
+        row = conn.execute("SELECT " + ", ".join(STATE_FIELDS) + " FROM receptions WHERE id = ?",
+                           (reception_id,)).fetchone()
+        return dict(row)
+
+    def _append_event(self, conn, reception_id, kind, previous, target, timestamp, source, *, before=None):
+        if self.schema_version == 1:
+            conn.execute(
+                "INSERT INTO reception_events(reception_id, event_type, from_status, to_status, "
+                "occurred_at, recorded_at, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (reception_id, kind, previous, target, timestamp, timestamp, source),
+            )
+        else:
+            after = self._audit_state(conn, reception_id)
+            conn.execute(
+                "INSERT INTO reception_events(reception_id, event_type, from_status, to_status, "
+                "occurred_at, recorded_at, source, audit_kind, revision_before, revision_after, "
+                "before_state_json, after_state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (reception_id, kind, previous, target, timestamp, timestamp, source,
+                 "registration_v2" if kind == "registered" else "staff_legacy_v2",
+                 before["revision"] if before is not None else None, after["revision"],
+                 _json(before) if before is not None else None, _json(after)),
+            )
+
     def transition(self, reception_id: str, target: str) -> dict:
         """Record a staff action; calling is never treated as actual seating."""
         allowed = {
@@ -393,10 +473,22 @@ class ReceptionStore:
             "seated": set(), "cancelled": set(),
         }
         with self._connection(write=True) as conn:
+            if self.schema_version == 2:
+                mode = conn.execute("SELECT staff_write_mode FROM store_metadata WHERE singleton = 1").fetchone()[0]
+                if mode != "legacy":
+                    # Check even for no-ops, before changing clocks or any rows.
+                    raise StateConflict("操作IDと期待revisionに対応していない更新経路は利用できません。")
             record = self._get(conn, reception_id)
             if record is None:
                 raise ReceptionNotFound(reception_id)
             previous = record["status"]
+            before = self._audit_state(conn, reception_id) if self.schema_version == 2 else None
+            if before is not None:
+                event = conn.execute("SELECT to_status,revision_after FROM reception_events "
+                                     "WHERE reception_id=? ORDER BY event_id DESC LIMIT 1", (reception_id,)).fetchone()
+                if (event is None or event["to_status"] != previous
+                        or (event["revision_after"] or 0) != before["revision"]):
+                    raise StoreValidationError("現在状態と監査履歴が一致しません。")
             if target == previous:
                 return record
             if target not in allowed[previous]:
@@ -410,14 +502,18 @@ class ReceptionStore:
             seated_at = timestamp if target == "seated" else None
             cancelled_at = timestamp if target == "cancelled" else None
             wait = (now - received).total_seconds() / 60 if target == "seated" else None
-            conn.execute(
+            revision_sql = ", revision = revision + 1" if before is not None else ""
+            revision_where = " AND revision = ?" if before is not None else ""
+            parameters = (target, called_at, seated_at, cancelled_at, wait, reception_id)
+            if before is not None:
+                parameters += (before["revision"],)
+            updated = conn.execute(
                 "UPDATE receptions SET status = ?, called_at = ?, seated_at = ?, cancelled_at = ?, "
-                "actual_wait_minutes = ? WHERE id = ?",
-                (target, called_at, seated_at, cancelled_at, wait, reception_id),
+                "actual_wait_minutes = ?" + revision_sql + " WHERE id = ?" + revision_where,
+                parameters,
             )
-            conn.execute(
-                "INSERT INTO reception_events(reception_id, event_type, from_status, to_status, "
-                "occurred_at, recorded_at, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (reception_id, target, previous, target, timestamp, timestamp, "staff_operation"),
-            )
+            if updated.rowcount != 1:
+                raise StateConflict("受付の更新版が変わりました。")
+            self._append_event(conn, reception_id, target, previous, target, timestamp,
+                               "staff_operation", before=before)
             return self._get(conn, reception_id)
