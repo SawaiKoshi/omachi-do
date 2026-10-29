@@ -102,6 +102,36 @@ class StaffReceptionResponse(BaseModel):
     staff_write_mode: Literal["legacy", "revision_required"]
 
 
+class SeatingCorrectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    operation_id: str
+    expected_revision: int = Field(ge=0, le=MAX_REVISION)
+    write_epoch: str
+    target_event_id: int = Field(ge=1, le=MAX_REVISION)
+    reason_code: Literal["wrong_reception", "accidental_seating", "other"]
+    reason_detail: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_correction(self):
+        self.operation_id = uuid_text(self.operation_id)
+        self.write_epoch = uuid_text(self.write_epoch)
+        if not self.reason_detail.strip():
+            raise ValueError("訂正理由を記録してください。")
+        return self
+
+
+class StaffEventsResponse(BaseModel):
+    events: list[dict]
+
+
+class StaffDataQualityResponse(BaseModel):
+    reception_id: str
+    training_use: Literal["blocked"]
+    issues: list[dict]
+    unresolved_issue_ids: list[int]
+    reasons: list[str]
+
+
 class StaffOperationError(BaseModel):
     code: str
     detail: str
@@ -110,7 +140,7 @@ class StaffOperationError(BaseModel):
 class StaffOperationResponse(BaseModel):
     operation_id: str
     reception_id: str
-    action: Literal["call", "absent", "return", "seat", "cancel"]
+    action: Literal["call", "absent", "return", "seat", "cancel", "seating_correction"]
     outcome: Literal["state_changed", "no_change", "rejected"]
     response_status: int
     recorded_at: str
@@ -300,6 +330,23 @@ def create_app(
              dependencies=[Depends(require_staff)])
     def staff_reception(reception_id: UUID, request: Request):
         return request.app.state.store.get_staff_reception(str(reception_id))
+
+    @app.get("/staff/receptions/{reception_id}/events", response_model=StaffEventsResponse,
+             dependencies=[Depends(require_staff)])
+    def staff_events(reception_id: UUID, request: Request):
+        return {"events": request.app.state.store.get_staff_events(str(reception_id))}
+
+    @app.get("/staff/receptions/{reception_id}/data-quality", response_model=StaffDataQualityResponse,
+             dependencies=[Depends(require_staff)])
+    def staff_data_quality(reception_id: UUID, request: Request):
+        return request.app.state.store.get_data_quality(str(reception_id))
+
+    @app.post("/staff/receptions/{reception_id}/seating-corrections", response_model=StaffOperationResponse)
+    def seating_correction(reception_id: UUID, command: SeatingCorrectionInput, request: Request,
+                           principal: Annotated[dict, Depends(require_staff)]):
+        result = request.app.state.store.correct_seating(str(reception_id), **command.model_dump(), **principal)
+        body = StaffOperationResponse.model_validate(result).model_dump(mode="json")
+        return JSONResponse(status_code=result["response_status"], content=body)
 
     @app.post("/staff/receptions/{reception_id}/operations", response_model=StaffOperationResponse)
     def protected_operation(reception_id: UUID, command: StaffOperationInput, request: Request,

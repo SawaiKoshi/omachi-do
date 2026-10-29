@@ -44,6 +44,20 @@ def command_request(reception_id, action, expected_revision, write_epoch):
                 expected_revision=expected_revision, write_epoch=uuid_text(write_epoch))
 
 
+def correction_request(reception_id, expected_revision, write_epoch, target_event_id,
+                       reason_code, reason_detail):
+    command = command_request(reception_id, "seat", expected_revision, write_epoch)
+    if type(target_event_id) is not int or not 1 <= target_event_id <= MAX_REVISION:
+        raise ValueError("A positive SQLite event ID is required.")
+    if (reason_code not in ("wrong_reception", "accidental_seating", "other")
+            or not isinstance(reason_detail, str) or not reason_detail.strip()
+            or len(reason_detail) > 500):
+        raise ValueError("A correction reason and nonblank detail are required.")
+    command.update(action="seating_correction", target_event_id=target_event_id,
+                   reason_code=reason_code, reason_detail=reason_detail)
+    return command
+
+
 def validate_principal(kind, principal_id):
     if (kind not in ("shared_staff_token", "staff_account", "system")
             or not isinstance(principal_id, str) or not 1 <= len(principal_id.strip())
@@ -53,8 +67,14 @@ def validate_principal(kind, principal_id):
 
 def saved_response(operation):
     """Fail closed on a damaged request/response ledger, including rejected results."""
-    command = command_request(operation["requested_reception_id"], operation["action"],
-                              operation["expected_revision"], operation["write_epoch"])
+    if operation["action"] == "seating_correction":
+        request = json.loads(operation["request_json"])
+        command = correction_request(operation["requested_reception_id"], operation["expected_revision"],
+                                     operation["write_epoch"], request["target_event_id"],
+                                     request["reason_code"], request["reason_detail"])
+    else:
+        command = command_request(operation["requested_reception_id"], operation["action"],
+                                  operation["expected_revision"], operation["write_epoch"])
     validate_principal(operation["principal_kind"], operation["principal_id"])
     encoded = canonical_json(command)
     if (operation["request_schema_version"] != REQUEST_VERSION
@@ -79,7 +99,7 @@ def saved_response(operation):
                 or set(error) != {"code", "detail"}
                 or not isinstance(error["code"], str) or not isinstance(error["detail"], str)
                 or not error["detail"].strip()
-                or error["code"] not in {"write_epoch_conflict", "revision_conflict", "state_conflict", "reception_not_found"}
+                or error["code"] not in {"write_epoch_conflict", "revision_conflict", "state_conflict", "reception_not_found", "correction_target_conflict"}
                 or response["response_status"] != (404 if error["code"] == "reception_not_found" else 409)
                 or (error["code"] == "reception_not_found" and operation["resolved_reception_id"] is not None)
                 or (error["code"] in ("revision_conflict", "state_conflict")
@@ -87,10 +107,13 @@ def saved_response(operation):
             raise ValueError("Invalid stored rejection.")
     elif response["outcome"] in ("state_changed", "no_change"):
         receipt = response["reception"]
+        correction = command["action"] == "seating_correction"
         if (response["response_status"] != 200 or response["error"] is not None
                 or not isinstance(receipt, dict) or set(receipt) != set(RECEIPT_FIELDS)
                 or receipt.get("id") != command["reception_id"]
-                or receipt.get("status") != ACTION_TARGETS[command["action"]]
+                or (receipt.get("status") not in ("waiting", "called", "absent") if correction
+                    else receipt.get("status") != ACTION_TARGETS[command["action"]])
+                or (correction and response["outcome"] != "state_changed")
                 or operation["resolved_reception_id"] != command["reception_id"]
                 or revision != command["expected_revision"] + (response["outcome"] == "state_changed")):
             raise ValueError("Invalid stored successful result.")

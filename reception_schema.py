@@ -11,6 +11,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from reception_migration.schema import expected_signature, signature
+from seat_correction_quality import expected_issues
 from staff_operation import RECEIPT_FIELDS, saved_response
 
 
@@ -57,8 +58,9 @@ def validate_schema(conn, version, *, check_integrity=True, allow_revision_requi
         except (ValueError, TypeError, AttributeError) as exc:
             raise SchemaValidationError("Invalid database identity or write epoch.") from exc
         modes = ("legacy", "revision_required") if allow_revision_required else ("legacy",)
-        if metadata[0][3] not in modes or metadata[0][4] != 0:
-            raise SchemaValidationError("Unsupported staff mode or enabled seat corrections.")
+        if (metadata[0][3] not in modes or metadata[0][4] not in (0, 1)
+                or (metadata[0][4] == 1 and metadata[0][3] != "revision_required")):
+            raise SchemaValidationError("Unsupported staff mode or correction configuration.")
         if conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version=2 AND from_version=1").fetchone()[0] != 1:
             raise SchemaValidationError("Missing v1 -> v2 migration provenance.")
 
@@ -103,8 +105,21 @@ def _same_state(actual, expected):
     return True
 
 
+def _same_json(actual, expected):
+    """JSON booleans and numeric types are not interchangeable audit values."""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(_same_json(actual[key], value)
+                                                   for key, value in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(_same_json(left, right)
+                                                   for left, right in zip(actual, expected))
+    return actual == expected
+
+
 def validate_history(conn, version):
-    """Replay committed ordinary operations; unsupported correction history fails closed.
+    """Replay committed operations, including append-only seating corrections.
 
     This verifies recorded-system consistency, not the truth of physical seating.
     Imported v1 events retain unknown revisions; their migration baseline is zero.
@@ -117,6 +132,7 @@ def validate_history(conn, version):
     snapshots = {record["reception_id"]: record for record in _records(conn, "reception_snapshots")}
     predictions = {record["reception_id"]: record for record in _records(conn, "predictions")}
     keys = {record["reception_id"]: record for record in _records(conn, "idempotency_keys")}
+    immutable_receipts = {}
     if any(set(records) != set(receptions) for records in (snapshots, predictions, keys)):
         raise SchemaValidationError("Missing or orphaned one-to-one intake data.")
 
@@ -154,7 +170,23 @@ def validate_history(conn, version):
         response = _object(keys[rid]["response_json"])
         if response.get("id") != rid or response.get("status") != "waiting":
             raise SchemaValidationError("Initial receipt no longer describes this intake.")
-        _object(predictions[rid]["result_json"])
+        snap = snapshots[rid]
+        immutable = {name: reception[name] for name in RECEIPT_FIELDS
+                     if name not in STATE_FIELDS and name not in ("snapshot", "prediction")}
+        immutable["snapshot"] = {
+            "captured_at": snap["captured_at"], "source": snap["source"],
+            "waiting_groups": snap["waiting_groups"], "ahead_groups": snap["ahead_groups"],
+            "ahead_same_size_groups": snap["ahead_same_size_groups"],
+            "party_size_groups": {"1-2": snap["groups_1_2"], "3-4": snap["groups_3_4"],
+                                  "5+": snap["groups_5_plus"]},
+        }
+        immutable["prediction"] = _object(predictions[rid]["result_json"])
+        immutable_receipts[rid] = immutable
+        # Migrated v1 receipts can be partial documents. Keep their exact JSON
+        # intact; the canonical intake tables remain authoritative for fields
+        # absent from that original cached response.
+        if any(not _same_json(response[name], value) for name, value in immutable.items() if name in response):
+            raise SchemaValidationError("Initial receipt changed immutable intake data.")
         if (timestamp(snapshots[rid]["captured_at"]) != received
                 or timestamp(predictions[rid]["predicted_at"]) != received):
             raise SchemaValidationError("Intake snapshot/prediction timestamp changed.")
@@ -166,6 +198,10 @@ def validate_history(conn, version):
     operations = {}
     audited_operations = set()
     revision_states = {}
+    seen_events = {}
+    latest_events = {}
+    corrected_seatings = set()
+    correction_events = []
     if version == 2:
         migration = rows(conn, "SELECT legacy_max_event_id,legacy_event_sequence,"
                          "legacy_reception_sequence FROM schema_migrations")[0]
@@ -213,13 +249,26 @@ def validate_history(conn, version):
                 if not _same_state(_object(event["after_state_json"]), state):
                     raise SchemaValidationError("Invalid registration audit projection.")
         else:
-            if (rid not in states or states[rid]["status"] != before or kind != after
+            correction = kind == "seating_corrected"
+            if correction:
+                target = seen_events.get(event.get("corrects_event_id"))
+                if (version != 2 or audit != "staff_v2" or rid not in states
+                        or states[rid]["status"] != "seated" or before != "seated"
+                        or after not in ("waiting", "called", "absent")
+                        or target is None or target["reception_id"] != rid
+                        or target["event_type"] != "seated" or target["from_status"] != after
+                        or latest_events.get(rid) != target["event_id"]
+                        or target["event_id"] in corrected_seatings):
+                    raise SchemaValidationError("Invalid or stale historical correction target.")
+                corrected_seatings.add(target["event_id"])
+                correction_events.append(event)
+            elif (rid not in states or states[rid]["status"] != before or kind != after
                     or after not in ALLOWED_TRANSITIONS.get(before, set())):
                 raise SchemaValidationError("Unsupported or invalid historical state transition.")
             old_state = states[rid]
             state = dict(old_state)
             state.update(status=after, seated_at=None, cancelled_at=None, actual_wait_minutes=None)
-            if after == "called":
+            if after == "called" and not correction:
                 state["called_at"] = event["occurred_at"]
             elif after == "seated":
                 state["seated_at"] = event["occurred_at"]
@@ -236,8 +285,9 @@ def validate_history(conn, version):
                     raise SchemaValidationError("Revision/audit state does not match the event chain.")
                 if audit == "staff_v2":
                     operation = operations.get(event["operation_id"])
-                    action = {"called": "call", "absent": "absent", "waiting": "return",
-                              "seated": "seat", "cancelled": "cancel"}[after]
+                    action = "seating_correction" if correction else {
+                        "called": "call", "absent": "absent", "waiting": "return",
+                        "seated": "seat", "cancelled": "cancel"}[after]
                     if (operation is None or operation["action"] != action
                             or operation["requested_reception_id"] != rid
                             or operation["resolved_reception_id"] != rid
@@ -248,14 +298,42 @@ def validate_history(conn, version):
                             or timestamp(operation["recorded_at"]) != recorded
                             or sha256(operation["request_json"].encode()).hexdigest() != operation["request_sha256"]):
                         raise SchemaValidationError("Staff operation does not match its audited state change.")
+                    if correction:
+                        command = _object(operation["request_json"])
+                        if (command.get("target_event_id") != event["corrects_event_id"]
+                                or command.get("reason_code") != event["reason_code"]
+                                or command.get("reason_detail") != event["reason_detail"]):
+                            raise SchemaValidationError("Correction request disagrees with its audit event.")
                     audited_operations.add(event["operation_id"])
         states[rid] = state
         revision_states[rid, state["revision"]] = (dict(state), recorded)
+        seen_events[event["event_id"]] = event
+        latest_events[rid] = event["event_id"]
     if set(states) != set(receptions):
         raise SchemaValidationError("Missing registration history.")
     if any(operation["outcome"] == "state_changed" and operation_id not in audited_operations
            for operation_id, operation in operations.items()):
         raise SchemaValidationError("Staff operation claims a state change without an audit event.")
+    if version == 2:
+        # Reviews and training approvals require their own versioned protocol,
+        # which is intentionally not enabled by the correction implementation.
+        if (_records(conn, "data_quality_reviews") or _records(conn, "data_quality_assessments")):
+            raise SchemaValidationError("Unsupported quality review/assessment history.")
+        expected_quality = {}
+        for correction in correction_events:
+            for issue in expected_issues(events, seen_events[correction["corrects_event_id"]], correction):
+                key = (issue["correction_event_id"], issue["reception_id"], issue["issue_kind"])
+                if key in expected_quality:
+                    raise SchemaValidationError("Duplicated expected correction quality issue.")
+                expected_quality[key] = issue
+        observed_quality = {}
+        for issue in _records(conn, "data_quality_issues"):
+            key = (issue["correction_event_id"], issue["reception_id"], issue["issue_kind"])
+            if key in observed_quality:
+                raise SchemaValidationError("Duplicated correction quality issue.")
+            observed_quality[key] = {name: value for name, value in issue.items() if name != "issue_id"}
+        if observed_quality != expected_quality:
+            raise SchemaValidationError("Correction quality coverage/evidence does not match event history.")
     for operation in operations.values():
         try:
             response = saved_response(operation)
@@ -282,9 +360,7 @@ def validate_history(conn, version):
                     or not _same_state({**{name: receipt[name] for name in STATE_FIELDS if name != "revision"},
                                         "revision": revision}, historical)):
                 raise SchemaValidationError("Archived staff result disagrees with historical state.")
-            initial = _object(keys[rid]["response_json"])
-            if any(receipt[name] != initial[name] for name in RECEIPT_FIELDS
-                   if name not in STATE_FIELDS):
+            if any(not _same_json(receipt[name], value) for name, value in immutable_receipts[rid].items()):
                 raise SchemaValidationError("Archived staff result changed immutable intake data.")
     for rid, state in states.items():
         projection = {name: receptions[rid][name] for name in STATE_FIELDS if name != "revision"}

@@ -21,9 +21,10 @@ from reception_schema import (
     ALLOWED_TRANSITIONS, STATE_FIELDS, SchemaValidationError, validate_history, validate_schema,
 )
 from staff_operation import (
-    ACTION_TARGETS, REQUEST_VERSION, canonical_json, command_request, receipt_response,
+    ACTION_TARGETS, REQUEST_VERSION, canonical_json, command_request, correction_request, receipt_response,
     saved_response, uuid_text, validate_principal,
 )
+from seat_correction_quality import expected_issues
 
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -632,3 +633,119 @@ class ReceptionStore:
             self._saved_staff_response(operation)
             self._save_staff_operation(conn, operation)
             return response
+
+    def _append_correction_event(self, conn, reception_id, before, target_event, timestamp,
+                                 operation_id, reason_code, reason_detail):
+        after = self._audit_state(conn, reception_id)
+        cursor = conn.execute(
+            "INSERT INTO reception_events(reception_id,event_type,from_status,to_status,occurred_at,"
+            "recorded_at,source,audit_kind,operation_id,revision_before,revision_after,corrects_event_id,"
+            "reason_code,reason_detail,before_state_json,after_state_json) "
+            "VALUES (?,'seating_corrected','seated',?,?,?,'staff_operation','staff_v2',?,?,?,?,?,?,?,?)",
+            (reception_id, after["status"], timestamp, timestamp, operation_id, before["revision"],
+             after["revision"], target_event["event_id"], reason_code, reason_detail, _json(before), _json(after)),
+        )
+        return dict(conn.execute("SELECT * FROM reception_events WHERE event_id=?", (cursor.lastrowid,)).fetchone())
+
+    @staticmethod
+    def _save_quality_issues(conn, issues):
+        for issue in issues:
+            conn.execute("INSERT INTO data_quality_issues(" + ",".join(issue) + ") VALUES(" +
+                         ",".join("?" for _ in issue) + ")", tuple(issue.values()))
+
+    def correct_seating(self, reception_id, *, operation_id, expected_revision, write_epoch,
+                        target_event_id, reason_code, reason_detail, principal_kind, principal_id):
+        """Invalidate exactly the current seating, preserving intake and all history.
+
+        This never grants training eligibility. The entire impact evidence set
+        must pass history validation before the transaction can be committed.
+        """
+        self._require_staff_v2()
+        try:
+            operation_id = uuid_text(operation_id)
+            command = correction_request(reception_id, expected_revision, write_epoch,
+                                         target_event_id, reason_code, reason_detail)
+            validate_principal(principal_kind, principal_id)
+        except (ValueError, TypeError) as exc:
+            raise StoreValidationError("訂正要求が不正です。") from exc
+        reception_id, write_epoch = command["reception_id"], command["write_epoch"]
+        request_json = canonical_json(command)
+        digest = sha256(request_json.encode()).hexdigest()
+        with self._connection(write=True) as conn:
+            existing = conn.execute("SELECT * FROM staff_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if existing is not None:
+                if (existing["principal_kind"] != principal_kind or existing["principal_id"] != principal_id
+                        or existing["request_json"] != request_json or existing["request_sha256"] != digest):
+                    raise StateConflict("操作IDが別の要求または認証主体で使用されています。")
+                return self._saved_staff_response(existing)
+            metadata = conn.execute("SELECT write_epoch,staff_write_mode,seat_corrections_enabled FROM store_metadata").fetchone()
+            if metadata["staff_write_mode"] != "revision_required" or metadata["seat_corrections_enabled"] != 1:
+                raise StateConflict("保護モードと明示的な訂正有効化が必要です。")
+            # Safety takes precedence over correction throughput: validate both
+            # the pre-existing chain and the complete transaction before COMMIT.
+            validate_history(conn, 2)
+            record = self._get(conn, reception_id)
+            before = self._checked_state(conn, reception_id) if record is not None else None
+            target = conn.execute("SELECT * FROM reception_events WHERE event_id=?", (target_event_id,)).fetchone()
+            latest = conn.execute("SELECT MAX(event_id) FROM reception_events WHERE reception_id=?", (reception_id,)).fetchone()[0]
+            error, status = None, 200
+            if write_epoch != metadata["write_epoch"]:
+                error, status = dict(code="write_epoch_conflict", detail="書込み世代が変わりました。最新情報を取得してください。"), 409
+            elif record is None:
+                error, status = dict(code="reception_not_found", detail="受付が見つかりません。"), 404
+            elif before["revision"] != expected_revision:
+                error, status = dict(code="revision_conflict", detail="受付が更新されています。最新情報を取得してください。"), 409
+            elif (record["status"] != "seated" or target is None
+                  or target["reception_id"] != reception_id or target["event_type"] != "seated"
+                  or target["from_status"] not in ACTIVE_STATUSES or target_event_id != latest
+                  or conn.execute("SELECT 1 FROM reception_events WHERE corrects_event_id=?", (target_event_id,)).fetchone()):
+                error, status = dict(code="correction_target_conflict", detail="現在有効な案内完了イベントではありません。"), 409
+            timestamp = self._now(conn, persist=True).isoformat()
+            if error is None:
+                updated = conn.execute(
+                    "UPDATE receptions SET status=?,seated_at=NULL,actual_wait_minutes=NULL,"
+                    "cancelled_at=NULL,revision=revision+1 WHERE id=? AND revision=?",
+                    (target["from_status"], reception_id, expected_revision),
+                )
+                if updated.rowcount != 1:
+                    raise StateConflict("受付の更新版が変わりました。")
+                correction = self._append_correction_event(conn, reception_id, before, target, timestamp,
+                                                           operation_id, reason_code, reason_detail)
+                events = [dict(row) for row in conn.execute("SELECT * FROM reception_events ORDER BY event_id")]
+                self._save_quality_issues(conn, expected_issues(events, target, correction))
+                record = self._get(conn, reception_id)
+            outcome = "rejected" if error else "state_changed"
+            revision = None if before is None else before["revision"] + (error is None)
+            response = dict(operation_id=operation_id, reception_id=reception_id, action="seating_correction",
+                            outcome=outcome, response_status=status, recorded_at=timestamp,
+                            resulting_revision=revision, reception=receipt_response(record) if not error else None,
+                            error=error)
+            operation = dict(operation_id=operation_id, request_schema_version=REQUEST_VERSION,
+                             requested_reception_id=reception_id,
+                             resolved_reception_id=reception_id if record is not None else None,
+                             action="seating_correction", write_epoch=write_epoch, expected_revision=expected_revision,
+                             principal_kind=principal_kind, principal_id=principal_id,
+                             request_json=request_json, request_sha256=digest, outcome=outcome,
+                             response_status=status, response_json=canonical_json(response),
+                             resulting_revision=revision, recorded_at=timestamp)
+            self._saved_staff_response(operation)
+            self._save_staff_operation(conn, operation)
+            validate_history(conn, 2)
+            return response
+
+    def get_data_quality(self, reception_id):
+        """Inspection only: no review API or approved SQLite training export exists."""
+        self._require_staff_v2()
+        with self._connection() as conn:
+            if self._get(conn, reception_id) is None:
+                raise ReceptionNotFound(reception_id)
+            issues = [dict(row) for row in conn.execute(
+                "SELECT * FROM data_quality_issues WHERE reception_id=? ORDER BY issue_id", (reception_id,))]
+            return dict(reception_id=reception_id, training_use="blocked", issues=issues,
+                        unresolved_issue_ids=[issue["issue_id"] for issue in issues],
+                        reasons=["sqlite_training_export_not_implemented", "quality_review_not_implemented"]
+                        + (["unresolved_quality_issues"] if issues else ["not_assessed"]))
+
+    def get_staff_events(self, reception_id):
+        self._require_staff_v2()
+        return self.get_events(reception_id)
