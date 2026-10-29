@@ -566,6 +566,8 @@ class ReceptionStore:
             if (operation is None or operation["principal_kind"] != principal_kind
                     or operation["principal_id"] != principal_id):
                 raise ReceptionNotFound(operation_id)
+            if operation["action"] in ("quality_review", "quality_assessment"):
+                validate_history(conn, 2)
             return self._saved_staff_response(operation)
 
     @staticmethod
@@ -734,7 +736,7 @@ class ReceptionStore:
             return response
 
     def get_data_quality(self, reception_id):
-        """Inspection only: no review API or approved SQLite training export exists."""
+        """Shared-staff inspection never grants training use."""
         self._require_staff_v2()
         with self._connection() as conn:
             if self._get(conn, reception_id) is None:
@@ -743,7 +745,7 @@ class ReceptionStore:
                 "SELECT * FROM data_quality_issues WHERE reception_id=? ORDER BY issue_id", (reception_id,))]
             return dict(reception_id=reception_id, training_use="blocked", issues=issues,
                         unresolved_issue_ids=[issue["issue_id"] for issue in issues],
-                        reasons=["sqlite_training_export_not_implemented", "quality_review_not_implemented"]
+                        reasons=["training_activation_disabled", "verified_review_authority_not_configured"]
                         + (["unresolved_quality_issues"] if issues else ["not_assessed"]))
 
     def get_staff_events(self, reception_id):

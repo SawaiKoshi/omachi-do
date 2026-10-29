@@ -23,6 +23,7 @@ from reception_store import (
     StoreBusy, StoreValidationError,
 )
 from staff_operation import MAX_REVISION, uuid_text
+from quality_review_store import QualityReviewStore
 
 
 class PartyInput(BaseModel):
@@ -146,6 +147,55 @@ class StaffOperationResponse(BaseModel):
     recorded_at: str
     resulting_revision: int | None
     reception: ReceptionResponse | None
+    error: StaffOperationError | None
+
+
+class QualityWatermarks(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    event_id: int = Field(ge=0, le=MAX_REVISION)
+    issue_id: int = Field(ge=0, le=MAX_REVISION)
+    review_id: int = Field(ge=0, le=MAX_REVISION)
+
+
+class QualityCommandInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    operation_id: str
+    expected_revision: int = Field(ge=0, le=MAX_REVISION)
+    write_epoch: str
+    expected_watermarks: QualityWatermarks
+    reason_code: str = Field(min_length=1, max_length=64)
+    reason_detail: str = Field(min_length=1, max_length=500)
+    evidence: dict
+
+    @model_validator(mode="after")
+    def validate_identifiers(self):
+        self.operation_id = uuid_text(self.operation_id)
+        self.write_epoch = uuid_text(self.write_epoch)
+        if not self.reason_code.strip() or not self.reason_detail.strip():
+            raise ValueError("品質判断の理由を記録してください。")
+        return self
+
+
+class QualityReviewInput(QualityCommandInput):
+    issue_id: int = Field(ge=1, le=MAX_REVISION)
+    expected_review_number: int = Field(ge=0, le=MAX_REVISION)
+    decision: Literal["hold", "exclude", "clear"]
+
+
+class QualityAssessmentInput(QualityCommandInput):
+    expected_assessment_id: int = Field(ge=0, le=MAX_REVISION)
+    decision: Literal["hold", "exclude", "eligible"]
+
+
+class QualityOperationResponse(BaseModel):
+    operation_id: str
+    reception_id: str
+    action: Literal["quality_review", "quality_assessment"]
+    outcome: Literal["review_added", "assessment_added", "rejected"]
+    response_status: int
+    recorded_at: str
+    resulting_revision: int | None
+    quality_result: dict | None
     error: StaffOperationError | None
 
 
@@ -341,6 +391,28 @@ def create_app(
     def staff_data_quality(reception_id: UUID, request: Request):
         return request.app.state.store.get_data_quality(str(reception_id))
 
+    @app.get("/staff/receptions/{reception_id}/quality-context", dependencies=[Depends(require_staff)])
+    def quality_context(reception_id: UUID, request: Request):
+        return QualityReviewStore(request.app.state.store).context(str(reception_id))
+
+    @app.post("/staff/receptions/{reception_id}/quality-reviews", response_model=QualityOperationResponse)
+    def quality_review(reception_id: UUID, command: QualityReviewInput, request: Request,
+                       principal: Annotated[dict, Depends(require_staff)]):
+        # The HTTP app has no release verifier. Shared authentication can only
+        # append hold/exclude decisions, even if callers request clear/eligible.
+        result = QualityReviewStore(request.app.state.store).review_issue(
+            str(reception_id), **command.model_dump(), **principal)
+        return JSONResponse(status_code=result["response_status"],
+                            content=QualityOperationResponse.model_validate(result).model_dump(mode="json"))
+
+    @app.post("/staff/receptions/{reception_id}/quality-assessments", response_model=QualityOperationResponse)
+    def quality_assessment(reception_id: UUID, command: QualityAssessmentInput, request: Request,
+                           principal: Annotated[dict, Depends(require_staff)]):
+        result = QualityReviewStore(request.app.state.store).assess(
+            str(reception_id), **command.model_dump(), **principal)
+        return JSONResponse(status_code=result["response_status"],
+                            content=QualityOperationResponse.model_validate(result).model_dump(mode="json"))
+
     @app.post("/staff/receptions/{reception_id}/seating-corrections", response_model=StaffOperationResponse)
     def seating_correction(reception_id: UUID, command: SeatingCorrectionInput, request: Request,
                            principal: Annotated[dict, Depends(require_staff)]):
@@ -359,7 +431,7 @@ def create_app(
         body = StaffOperationResponse.model_validate(result).model_dump(mode="json")
         return JSONResponse(status_code=result["response_status"], content=body)
 
-    @app.get("/staff/operations/{operation_id}", response_model=StaffOperationResponse)
+    @app.get("/staff/operations/{operation_id}", response_model=StaffOperationResponse | QualityOperationResponse)
     def staff_operation_result(operation_id: UUID, request: Request,
                                principal: Annotated[dict, Depends(require_staff)]):
         # Lookup itself is 200; response_status describes the original command.

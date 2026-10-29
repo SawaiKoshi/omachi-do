@@ -67,6 +67,9 @@ def validate_principal(kind, principal_id):
 
 def saved_response(operation):
     """Fail closed on a damaged request/response ledger, including rejected results."""
+    if operation["action"] in ("quality_review", "quality_assessment"):
+        from quality_protocol import saved_quality_response
+        return saved_quality_response(operation)
     if operation["action"] == "seating_correction":
         request = json.loads(operation["request_json"])
         command = correction_request(operation["requested_reception_id"], operation["expected_revision"],

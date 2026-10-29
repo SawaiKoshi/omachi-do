@@ -315,10 +315,6 @@ def validate_history(conn, version):
            for operation_id, operation in operations.items()):
         raise SchemaValidationError("Staff operation claims a state change without an audit event.")
     if version == 2:
-        # Reviews and training approvals require their own versioned protocol,
-        # which is intentionally not enabled by the correction implementation.
-        if (_records(conn, "data_quality_reviews") or _records(conn, "data_quality_assessments")):
-            raise SchemaValidationError("Unsupported quality review/assessment history.")
         expected_quality = {}
         for correction in correction_events:
             for issue in expected_issues(events, seen_events[correction["corrects_event_id"]], correction):
@@ -334,6 +330,8 @@ def validate_history(conn, version):
             observed_quality[key] = {name: value for name, value in issue.items() if name != "issue_id"}
         if observed_quality != expected_quality:
             raise SchemaValidationError("Correction quality coverage/evidence does not match event history.")
+        from quality_history import validate_quality_history
+        validate_quality_history(conn)
     for operation in operations.values():
         try:
             response = saved_response(operation)
