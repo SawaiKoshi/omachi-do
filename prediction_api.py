@@ -10,7 +10,7 @@ import sqlite3
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +24,11 @@ from reception_store import (
 )
 from staff_operation import MAX_REVISION, uuid_text
 from quality_review_store import QualityReviewStore
+from staff_read_store import StaffReadStore
+from staff_sessions import (
+    ABSOLUTE_SECONDS, COOKIE_NAME, SHARED_PRINCIPAL, SessionCapacity, SessionRejected,
+    StaffSessions, browser_origin,
+)
 
 
 class PartyInput(BaseModel):
@@ -234,7 +239,7 @@ class PublicQueueResponse(BaseModel):
 
 def create_app(
     *, db_path: str | Path | None = None, model_path: str | Path | None = None,
-    staff_token: str | None = None, clock=None,
+    staff_token: str | None = None, clock=None, staff_browser_origin: str | None = None,
 ) -> FastAPI:
     """Uvicornのfactory。DBと信頼済みモデルはlifespan開始時だけ開く。"""
     database = Path(db_path or os.environ.get("OMACHI_DB_PATH", "var/receptions.sqlite3"))
@@ -242,19 +247,26 @@ def create_app(
     token = staff_token if staff_token is not None else os.environ.get("OMACHI_STAFF_TOKEN")
     if token is not None and (len(token) < 32 or not token.strip()):
         raise ValueError("OMACHI_STAFF_TOKENは32文字以上のランダムな値にしてください。")
+    session_origin = browser_origin(staff_browser_origin)
 
     @asynccontextmanager
     async def lifespan(app):
         app.state.store = ReceptionStore(database, clock=clock)
         app.state.predictor = PredictionService(trusted_model)
-        yield
+        app.state.staff_reads = StaffReadStore(app.state.store)
+        app.state.staff_sessions = StaffSessions()
+        try:
+            yield
+        finally:
+            app.state.staff_sessions.clear()
 
     app = FastAPI(title="おまちどう（ローカル開発用）", lifespan=lifespan, openapi_url=None)
     web_directory = Path(__file__).resolve().parent / "web"
     app.mount("/assets", StaticFiles(directory=web_directory / "static", check_dir=False),
               name="customer-assets")
     app.add_middleware(
-        TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"],
+        TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"]
+        + (["staff.localhost"] if session_origin is not None else []),
     )
 
     @app.middleware("http")
@@ -264,24 +276,111 @@ def create_app(
         except ValueError:
             local = False
         if not local:
-            return JSONResponse(status_code=403, content={"detail": "ローカル接続専用です。"})
+            return JSONResponse(status_code=403, content={"detail": "ローカル接続専用です。"},
+                                headers={"Cache-Control": "no-store"})
+        # A cookie is scoped by hostname, not port. Keep the staff origin on a
+        # separate host and never serve customer HTML/JS or public APIs there.
+        if request.url.hostname == "staff.localhost":
+            if (session_origin is None or str(request.base_url).rstrip("/") != session_origin
+                    or not request.url.path.startswith("/staff/")
+                    or any(name in request.headers for name in (
+                        "forwarded", "x-forwarded-proto", "x-forwarded-host", "x-forwarded-for"))):
+                return JSONResponse(status_code=403, content={"detail": "スタッフ専用HTTPS接続が必要です。"},
+                                    headers={"Cache-Control": "no-store"})
         # 別サイトからのブラウザ操作を拒否。CORSやproxy転送は有効にしない。
         origin = request.headers.get("origin")
-        if origin is not None and origin != str(request.base_url).rstrip("/"):
-            return JSONResponse(status_code=403, content={"detail": "異なるオリジンからの操作はできません。"})
+        if (len(request.headers.getlist("origin")) > 1
+                or origin is not None and origin != str(request.base_url).rstrip("/")):
+            return JSONResponse(status_code=403, content={"detail": "異なるオリジンからの操作はできません。"},
+                                headers={"Cache-Control": "no-store"})
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
+        if request.url.path.startswith("/staff/"):
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
         return response
 
-    def require_staff(x_staff_token: Annotated[str | None, Header()] = None):
+    def require_credential(request, x_staff_token):
         if token is None:
             raise HTTPException(503, "スタッフ操作は未設定です。OMACHI_STAFF_TOKENを設定してください。")
-        if x_staff_token is None or not hmac.compare_digest(x_staff_token.encode(), token.encode()):
+        if (len(request.headers.getlist("x-staff-token")) != 1 or x_staff_token is None
+                or not hmac.compare_digest(x_staff_token.encode(), token.encode())):
             raise HTTPException(401, "スタッフ認証が必要です。")
-        # This credential authenticates the shared staff role, not an individual.
-        # Neither the token nor a token-derived fingerprint enters the ledger.
-        return {"principal_kind": "shared_staff_token", "principal_id": "shared-staff"}
+
+    def session_cookie(request):
+        parts = [part.split("=", 1) for header in request.headers.getlist("cookie")
+                 for part in header.split(";") if "=" in part]
+        values = [value.strip() for name, value in parts if name.strip() == COOKIE_NAME]
+        if len(values) > 1:
+            raise HTTPException(401, "スタッフセッションを確認できません。")
+        return values[0] if values else None
+
+    def require_session_origin(request, *, writing=False):
+        if session_origin is None or token is None:
+            raise HTTPException(503, "ブラウザ用スタッフ認証は無効です。")
+        if str(request.base_url).rstrip("/") != session_origin:
+            raise HTTPException(403, "スタッフ専用HTTPS接続が必要です。")
+        if writing and (request.headers.getlist("origin") != [session_origin]):
+            raise HTTPException(403, "同一オリジンの確認が必要です。")
+
+    def authenticated_session(request, *, writing=False):
+        require_session_origin(request, writing=writing)
+        if writing and len(request.headers.getlist("x-csrf-token")) != 1:
+            raise HTTPException(403, "CSRF確認が必要です。")
+        try:
+            return request.app.state.staff_sessions.authenticate(
+                session_cookie(request), csrf=request.headers.get("x-csrf-token"), require_csrf=writing)
+        except SessionRejected:
+            raise HTTPException(401, "スタッフセッションまたはCSRFを確認できません。") from None
+
+    def require_staff(request: Request, x_staff_token: Annotated[str | None, Header()] = None):
+        # Cookie failures never fall back to a supplied header credential.
+        cookie = session_cookie(request)
+        if cookie is not None or str(request.base_url).rstrip("/") == session_origin:
+            writing = request.method not in ("GET", "HEAD", "OPTIONS")
+            authenticated_session(request, writing=writing)
+            if not request.url.path.startswith("/staff/"):
+                raise HTTPException(403, "ブラウザ認証では旧更新APIを利用できません。")
+            if writing and request.scope["route"].path not in (
+                "/staff/receptions/{reception_id}/operations",
+                "/staff/receptions/{reception_id}/seating-corrections",
+            ):
+                # Browser sessions do not receive quality review/release powers.
+                raise HTTPException(403, "ブラウザからこの管理操作は利用できません。")
+            if writing and not request.app.state.staff_reads.configuration()["write_enabled"]:
+                raise HTTPException(409, "保護付き更新モードが必要です。")
+            request.state.staff_browser_authenticated = True
+        else:
+            require_credential(request, x_staff_token)
+        # Shared role only; no claimed individual identity or token fingerprint.
+        return dict(SHARED_PRINCIPAL)
+
+    @app.post("/staff/session")
+    def login(request: Request, response: Response,
+              x_staff_token: Annotated[str | None, Header()] = None):
+        require_session_origin(request, writing=True)
+        if not request.app.state.staff_sessions.allow_login():
+            raise HTTPException(429, "時間をおいて再試行してください。", headers={"Retry-After": "60"})
+        require_credential(request, x_staff_token)
+        try:
+            cookie, _ = request.app.state.staff_sessions.create(session_cookie(request))
+        except SessionCapacity:
+            raise HTTPException(503, "スタッフセッションの上限に達しました。") from None
+        response.set_cookie(COOKIE_NAME, cookie, max_age=ABSOLUTE_SECONDS,
+                            secure=True, httponly=True, samesite="strict", path="/")
+        return request.app.state.staff_sessions.authenticate(cookie)
+
+    @app.get("/staff/session")
+    def current_session(request: Request):
+        return authenticated_session(request)
+
+    @app.delete("/staff/session")
+    def logout(request: Request, response: Response):
+        authenticated_session(request, writing=True)
+        request.app.state.staff_sessions.revoke(session_cookie(request))
+        response.delete_cookie(COOKIE_NAME, secure=True, httponly=True, samesite="strict", path="/")
+        return {"authenticated": False}
 
     async def require_no_body(request: Request):
         if await request.body():
@@ -381,6 +480,17 @@ def create_app(
     def staff_reception(reception_id: UUID, request: Request):
         return request.app.state.store.get_staff_reception(str(reception_id))
 
+    @app.get("/staff/receptions", dependencies=[Depends(require_staff)])
+    def staff_receptions(request: Request, view: Literal["active", "recently_seated"] = "active",
+                         limit: Annotated[int, Query(ge=1, le=100)] = 50,
+                         hours: Annotated[int, Query(ge=1, le=168)] = 24,
+                         cursor: Annotated[str | None, Query(min_length=1, max_length=2048)] = None):
+        return request.app.state.staff_reads.listing(view=view, limit=limit, hours=hours, cursor=cursor)
+
+    @app.get("/staff/receptions/{reception_id}/operation-context", dependencies=[Depends(require_staff)])
+    def staff_operation_context(reception_id: UUID, request: Request):
+        return request.app.state.staff_reads.detail(str(reception_id))
+
     @app.get("/staff/receptions/{reception_id}/events", response_model=StaffEventsResponse,
              dependencies=[Depends(require_staff)])
     def staff_events(reception_id: UUID, request: Request):
@@ -426,6 +536,7 @@ def create_app(
         result = request.app.state.store.staff_transition(
             str(reception_id), command.action, operation_id=command.operation_id,
             expected_revision=command.expected_revision, write_epoch=command.write_epoch, **principal,
+            require_revision_mode=getattr(request.state, "staff_browser_authenticated", False),
         )
         # Validate and filter even persisted responses before returning them.
         body = StaffOperationResponse.model_validate(result).model_dump(mode="json")

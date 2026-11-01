@@ -576,7 +576,7 @@ class ReceptionStore:
                      ",".join("?" for _ in operation) + ")", tuple(operation.values()))
 
     def staff_transition(self, reception_id, action, *, operation_id, expected_revision,
-                         write_epoch, principal_kind, principal_id):
+                         write_epoch, principal_kind, principal_id, require_revision_mode=False):
         """Atomically claim a command and archive its result, including business rejections.
 
         An existing command is replayed before checking today's revision/epoch.
@@ -594,6 +594,11 @@ class ReceptionStore:
         request_json = canonical_json(command)
         digest = sha256(request_json.encode()).hexdigest()
         with self._connection(write=True) as conn:
+            # Browser transport is read-only outside protected mode. Check under
+            # the write lock as well, so a mode change cannot race authentication.
+            if require_revision_mode and conn.execute(
+                    "SELECT staff_write_mode FROM store_metadata").fetchone()[0] != "revision_required":
+                raise StateConflict("ブラウザ操作には保護付き更新モードが必要です。")
             existing = conn.execute("SELECT * FROM staff_operations WHERE operation_id=?", (operation_id,)).fetchone()
             if existing is not None:
                 if (existing["principal_kind"] != principal_kind or existing["principal_id"] != principal_id
