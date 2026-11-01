@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>スタッフログイン | おまちどう</title>
+  <link rel="stylesheet" href="/staff/assets/staff.css">
+  <script type="module" src="/staff/assets/staff.mjs"></script>
+</head>
+<body data-staff-page="login">
+  <header class="app-header"><a class="brand" href="/staff/login"><span class="brand-mark" aria-hidden="true">お</span>おまちどう<span class="brand-caption">スタッフ専用</span></a></header>
+  <main class="login-main">
+    <section id="login-view" class="panel login-panel" aria-labelledby="login-title">
+      <p class="eyebrow">STAFF ACCESS</p>
+      <h1 id="login-title">スタッフログイン</h1>
+      <p class="help">店舗で共有している認証情報を入力してください。</p>
+      <form id="login-form" action="/staff/session" method="post" autocomplete="off">
+        <label for="staff-token">共有スタッフ認証情報</label>
+        <input id="staff-token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="shared-note" disabled>
+        <button id="login-button" class="primary" type="submit" disabled>ログイン</button>
+      </form>
+      <p id="login-message" class="message" role="status" aria-live="polite">安全な接続を確認しています…</p>
+      <p id="shared-note" class="help shared-note">共有認証です。個々のスタッフの本人確認を行うものではありません。</p>
+    </section>
+    <p id="status-message" class="message" role="status" hidden></p>
+    <noscript><p class="message">スタッフ画面にはJavaScriptと専用HTTPS接続が必要です。</p></noscript>
+  </main>
+</body>
+</html>

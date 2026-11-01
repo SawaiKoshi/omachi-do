@@ -12,7 +12,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -262,6 +262,11 @@ def create_app(
 
     app = FastAPI(title="おまちどう（ローカル開発用）", lifespan=lifespan, openapi_url=None)
     web_directory = Path(__file__).resolve().parent / "web"
+    staff_pages = {"/staff/login", "/staff/"}
+    staff_page_policy = (
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+        "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
     app.mount("/assets", StaticFiles(directory=web_directory / "static", check_dir=False),
               name="customer-assets")
     app.add_middleware(
@@ -298,7 +303,12 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         if request.url.path.startswith("/staff/"):
             response.headers["Referrer-Policy"] = "no-referrer"
-            response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+            response.headers["Content-Security-Policy"] = (
+                staff_page_policy
+                if (request.url.path in staff_pages and response.status_code == 200
+                    and response.headers.get("content-type", "").startswith("text/html"))
+                else "default-src 'none'; frame-ancestors 'none'"
+            )
         return response
 
     def require_credential(request, x_staff_token):
@@ -387,6 +397,37 @@ def create_app(
             raise HTTPException(422, "操作の本文は不要です。日時はシステムが記録します。")
 
     staff_operations = [Depends(require_staff), Depends(require_no_body)]
+
+    def require_staff_page_origin(request):
+        # Header authentication remains available to native API clients, but it
+        # never grants staff pages on a customer host or without a session.
+        require_session_origin(request)
+
+    @app.get("/staff/login", include_in_schema=False)
+    def staff_login_page(request: Request):
+        require_staff_page_origin(request)
+        return FileResponse(web_directory / "staff" / "login.html")
+
+    @app.get("/staff/", include_in_schema=False)
+    def staff_dashboard_page(request: Request):
+        require_staff_page_origin(request)
+        try:
+            authenticated_session(request)
+        except HTTPException as error:
+            if error.status_code != 401:
+                raise
+            return RedirectResponse("/staff/login", status_code=303)
+        return FileResponse(web_directory / "staff" / "index.html")
+
+    @app.get("/staff/assets/staff.mjs", include_in_schema=False)
+    def staff_script(request: Request):
+        require_staff_page_origin(request)
+        return FileResponse(web_directory / "staff" / "assets" / "staff.mjs", media_type="text/javascript")
+
+    @app.get("/staff/assets/staff.css", include_in_schema=False)
+    def staff_stylesheet(request: Request):
+        require_staff_page_origin(request)
+        return FileResponse(web_directory / "staff" / "assets" / "staff.css", media_type="text/css")
 
     @app.get("/", include_in_schema=False)
     def customer_reception():

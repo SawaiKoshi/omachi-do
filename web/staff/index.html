@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>受付状況 | おまちどう スタッフ</title>
+  <link rel="stylesheet" href="/staff/assets/staff.css">
+  <script type="module" src="/staff/assets/staff.mjs"></script>
+</head>
+<body data-staff-page="receptions">
+  <header class="app-header">
+    <a class="brand" href="/staff/"><span class="brand-mark" aria-hidden="true">お</span>おまちどう<span class="brand-caption">スタッフ専用</span></a>
+    <button id="logout-button" type="button" class="secondary" disabled>ログアウト</button>
+  </header>
+  <main class="staff-main">
+    <div class="page-heading"><div><p class="eyebrow">RECEPTION OVERVIEW</p><h1>受付状況 <span class="readonly">閲覧のみ</span></h1></div><button id="refresh-button" class="secondary" type="button" disabled>最新情報を取得</button></div>
+    <p class="help">共有認証でログインしています。この画面から受付状態は変更できません。</p>
+    <p id="status-message" class="message" role="status" aria-live="polite">セッションを確認しています…</p>
+    <p id="updated-at" class="updated">まだ更新されていません</p>
+    <div id="staff-view" hidden>
+      <section class="summary-grid" aria-label="未案内受付の内訳">
+        <div class="summary waiting"><p>待機中</p><strong id="waiting-count">—</strong><span>組</span></div>
+        <div class="summary called"><p>呼出中</p><strong id="called-count">—</strong><span>組</span></div>
+        <div class="summary absent"><p>不在</p><strong id="absent-count">—</strong><span>組</span></div>
+      </section>
+      <section class="panel reception-panel" aria-labelledby="active-title">
+        <div class="section-heading"><h2 id="active-title">未案内のお客様</h2><span class="order-note">元の受付順</span></div>
+        <p class="help">受付番号を選ぶと詳細を確認できます。番号と受付日をあわせてご確認ください。</p>
+        <ol id="active-list" class="reception-list" aria-label="受付順の未案内一覧"></ol>
+        <p id="active-empty" class="empty-state" hidden>未案内の受付はありません。</p>
+      </section>
+      <section class="panel reception-panel" aria-labelledby="recent-title">
+        <div class="section-heading"><h2 id="recent-title">最近の案内履歴</h2><span class="order-note">直近24時間・案内順の新しい順</span></div>
+        <p class="help">現在有効な案内完了のみ表示します。訂正済みの案内は含みません。</p>
+        <ol id="recent-list" class="reception-list" aria-label="最近の有効な案内済み一覧"></ol>
+        <p id="recent-empty" class="empty-state" hidden>直近24時間の案内完了はありません。</p>
+      </section>
+      <section id="detail-view" class="panel detail-panel" aria-labelledby="detail-title" hidden>
+        <div class="section-heading"><h2 id="detail-title" tabindex="-1">受付詳細</h2><button id="detail-close" class="secondary" type="button">詳細を閉じる</button></div>
+        <p class="help">現在の操作対象情報の確認用です。操作はできません。</p>
+        <div id="detail-content"></div>
+      </section>
+    </div>
+    <noscript><p class="message">認証を確認できないため受付情報を表示しません。JavaScriptを有効にしてください。</p></noscript>
+  </main>
+  <footer>閲覧専用 · 呼出・案内・取消・訂正・通知はこの画面では行えません。</footer>
+</body>
+</html>
