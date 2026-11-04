@@ -3,6 +3,7 @@ const POLL_INTERVAL = 5_000;
 const REQUEST_TIMEOUT = 15_000;
 const PAGE_LIMIT = 100;
 const MAX_PAGES = 100;
+const ACTION_LABELS = { call: "呼出", absent: "不在", return: "復帰", seat: "案内完了", cancel: "受付取消", seating_correction: "誤案内訂正" };
 const LABELS = { waiting: "待機中", called: "呼出中", absent: "不在", seated: "案内済み", cancelled: "取消済み" };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const integer = (value, min = 0) => Number.isSafeInteger(value) && value >= min;
@@ -40,6 +41,24 @@ function validRow(row) {
       && timestamp(event.occurred_at) && typeof event.correctable === "boolean");
 }
 
+// Compare the displayed contract, independently of JSON property order. The
+// global view version may advance for a different reception without changing
+// this reception's read-only interaction target.
+function rowSignature(row) {
+  const seat = row.valid_seating_event;
+  return JSON.stringify([
+    ...["id", "display_number", "reception_order", "received_at", "adults", "children", "total_people",
+      "status", "called_at", "seated_at", "cancelled_at", "actual_wait_minutes", "revision"].map(key => row[key]),
+    Array.isArray(row.allowed_actions) ? [...new Set(row.allowed_actions.filter(action => typeof action === "string"))].sort() : null,
+    seat === null ? null : [seat.event_id, seat.from_status, seat.to_status, seat.occurred_at, seat.correctable],
+  ]);
+}
+
+function metadataSignature(value) {
+  return JSON.stringify([value.schema_version, value.database_id, value.write_epoch, value.staff_write_mode,
+    value.seat_corrections_enabled, value.write_enabled, value.disabled_reason]);
+}
+
 function numberText(value) {
   const match = /^(\d{4})(\d{2})(\d{2})-(\d+)$/.exec(value);
   return match ? `${match[1]}/${match[2]}/${match[3]} · ${match[4]}番` : value;
@@ -61,22 +80,122 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   let csrf = "", logoutCsrf = "", absoluteDeadline = null;
   let authVersion = 0, refreshVersion = 0, detailVersion = 0;
   let pollTimer = null, expiryTimer = null;
-  let displayedVersion = null, activeRows = [], recentRows = [];
-  const controllers = new Set();
-  const text = (id, value) => { if (get(id)) get(id).textContent = value; };
-  const hidden = (id, value) => { if (get(id)) get(id).hidden = value; };
-  const disabled = (id, value) => { if (get(id)) get(id).disabled = value; };
-  const message = (value, login = false) => { const id = login ? "login-message" : "status-message"; text(id, value); hidden(id, !value); };
+  let displayedVersion = null, displayedMetadata = null, detailTarget = null;
+  let selectedTab = "active", menuEntry = null, gesture = null;
+  let detailReturnTarget = null;
+  let suppressClickUntil = 0;
+  const pointers = new Set(), rowNodes = new Map(), scrollPositions = { active: 0, recently_seated: 0 };
+  const controllers = new Map();
+  const text = (id, value) => { if (get(id) && get(id).textContent !== value) get(id).textContent = value; };
+  const hidden = (id, value) => { if (get(id) && get(id).hidden !== value) get(id).hidden = value; };
+  const disabled = (id, value) => { if (get(id) && get(id).disabled !== value) get(id).disabled = value; };
+  const message = (value, login = false) => {
+    const id = login ? "login-message" : "status-message";
+    text(id, value); hidden(id, !value);
+    if (!login) hidden("updated-at", Boolean(value));
+  };
 
-  function closeDetail() {
+  function canBrowse() {
+    return started && authenticated && !paused && !needsLogin && !logoutPending
+      && displayedVersion !== null && !get("staff-view")?.hidden && get("staff-view")?.dataset.state === "current";
+  }
+
+  function closeMenu({ restoreFocus = false } = {}) {
+    const previous = menuEntry;
+    menuEntry = null; gesture = null;
+    if (previous) {
+      previous.trigger.setAttribute("aria-expanded", "false");
+      previous.item.dataset.menuOpen = "false";
+    }
+    hidden("row-menu", true);
+    text("row-menu-title", "受付メニュー"); text("row-menu-status", "");
+    get("row-menu-items")?.replaceChildren();
+    if (restoreFocus && previous && canBrowse() && rowNodes.get(previous.key) === previous) previous.trigger.focus();
+  }
+
+  function applyTabs() {
+    for (const [view, prefix] of [["active", "active"], ["recently_seated", "recent"]]) {
+      get(`${prefix}-tab`)?.setAttribute("aria-selected", String(selectedTab === view));
+      get(`${prefix}-tab`)?.setAttribute("tabindex", selectedTab === view ? "0" : "-1");
+      hidden(`${prefix}-panel`, selectedTab !== view);
+    }
+  }
+
+  function selectTab(view, { focus = false } = {}) {
+    if (!canBrowse() || !["active", "recently_seated"].includes(view)) return false;
+    closeMenu(); closeDetail();
+    const scroll = get("reception-scroll");
+    if (scroll) scrollPositions[selectedTab] = scroll.scrollTop;
+    selectedTab = view; applyTabs();
+    if (scroll) scroll.scrollTop = scrollPositions[view];
+    if (focus) get(view === "active" ? "active-tab" : "recent-tab")?.focus();
+    return true;
+  }
+
+  function openMenu(entry) {
+    if (!canBrowse() || entry.view !== selectedTab || rowNodes.get(entry.key) !== entry) return false;
+    closeMenu(); closeDetail();
+    menuEntry = entry;
+    entry.trigger.setAttribute("aria-expanded", "true"); entry.item.dataset.menuOpen = "true";
+    text("row-menu-title", `${numberText(entry.row.display_number)}のメニュー`);
+    text("row-menu-status", `現在状態：${LABELS[entry.row.status]}`);
+    const actions = Array.isArray(entry.row.allowed_actions)
+      ? [...new Set(entry.row.allowed_actions)].filter(action => typeof action === "string" && Object.hasOwn(ACTION_LABELS, action)) : [];
+    get("row-menu-items").replaceChildren(...(actions.length ? actions.map(action => element("li", `${ACTION_LABELS[action]}（未接続・実行不可）`))
+      : [element("li", "この受付に利用可能な操作項目はありません。") ]));
+    hidden("row-menu", false); get("row-menu").focus();
+    return true;
+  }
+
+  function trackMove(event) {
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const dx = event.clientX - gesture.x, dy = event.clientY - gesture.y;
+    gesture.dx = dx;
+    gesture.maxY = Math.max(gesture.maxY, Math.abs(dy));
+    gesture.moved = gesture.moved || Math.hypot(dx, dy) >= 12;
+    if (dx < -12 || gesture.maxY > 20 || Math.abs(dy) >= 12 && Math.abs(dy) > Math.abs(dx) * .6) gesture.cancelled = true;
+  }
+
+  function bindRowGestures(entry) {
+    entry.item.addEventListener("pointerdown", event => {
+      if (!canBrowse() || entry.view !== selectedTab || !["touch", "pen"].includes(event.pointerType)
+          || event.isPrimary === false || event.button !== 0 || !Number.isInteger(event.pointerId)
+          || pointers.size > 1 || entry.trigger.contains(event.target)) return;
+      gesture = { entry, pointerId: event.pointerId, x: event.clientX, y: event.clientY,
+        startedAt: now(), dx: 0, maxY: 0, moved: false, cancelled: false };
+    });
+    entry.item.addEventListener("pointermove", trackMove);
+    entry.item.addEventListener("pointerup", event => {
+      if (!gesture || gesture.entry !== entry || gesture.pointerId !== event.pointerId) return;
+      trackMove(event);
+      const completed = gesture; gesture = null;
+      if (completed.moved) suppressClickUntil = now() + 500;
+      if (!completed.cancelled && completed.dx >= 72 && completed.dx >= completed.maxY * 3
+          && now() - completed.startedAt <= 1200 && canBrowse()) openMenu(entry);
+    });
+    for (const type of ["pointercancel", "lostpointercapture", "pointerleave"]) {
+      entry.item.addEventListener(type, () => {
+        if (gesture?.entry === entry) { if (gesture.moved) suppressClickUntil = now() + 500; gesture = null; }
+      });
+    }
+  }
+
+  function closeDetail({ restoreFocus = false } = {}) {
+    const target = detailReturnTarget; detailReturnTarget = null;
+    detailTarget = null;
     detailVersion += 1;
     hidden("detail-view", true);
     text("detail-title", "受付詳細");
     get("detail-content")?.replaceChildren();
+    if (restoreFocus && target && canBrowse() && [...rowNodes.values()].some(entry => entry.button === target)) target.focus();
   }
 
   function clearData() {
-    activeRows = []; recentRows = []; displayedVersion = null;
+    closeMenu(); pointers.clear(); rowNodes.clear(); selectedTab = "active"; applyTabs();
+    scrollPositions.active = 0; scrollPositions.recently_seated = 0;
+    if (get("reception-scroll")) get("reception-scroll").scrollTop = 0;
+    disabled("active-tab", true); disabled("recent-tab", true);
+    displayedVersion = null; displayedMetadata = null;
     for (const id of ["active-list", "recent-list"]) get(id)?.replaceChildren();
     for (const id of ["waiting-count", "called-count", "absent-count"]) text(id, "—");
     for (const id of ["active-empty", "recent-empty"]) hidden(id, true);
@@ -84,9 +203,13 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     closeDetail();
   }
 
-  function abortReads() {
-    refreshVersion += 1; detailVersion += 1;
-    for (const controller of controllers) controller.abort();
+  function abortReads({ preserveInteraction = false } = {}) {
+    if (!preserveInteraction) { closeMenu(); pointers.clear(); }
+    refreshVersion += 1;
+    if (!preserveInteraction) detailVersion += 1;
+    for (const [controller, purpose] of controllers) {
+      if (!preserveInteraction || purpose !== "detail") controller.abort();
+    }
     env.clearTimeout(pollTimer); pollTimer = null;
   }
 
@@ -100,10 +223,10 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     message(value, page === "login");
   }
 
-  async function request(path, { method = "GET", headers = {} } = {}) {
+  async function request(path, { method = "GET", headers = {}, purpose = "refresh" } = {}) {
     if (!secureOrigin()) throw new ReadError("insecure");
     const controller = new env.AbortController();
-    controllers.add(controller);
+    controllers.set(controller, purpose);
     let timeout, abortHandler;
     try {
       const interrupted = new Promise((_, reject) => {
@@ -115,6 +238,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
         method, credentials: "same-origin", mode: "same-origin", cache: "no-store", redirect: "error",
         referrerPolicy: "no-referrer", signal: controller.signal, headers: { Accept: "application/json", ...headers },
       }), interrupted]);
+      hidden("synthetic-preview", response.headers?.get("X-Omachi-Preview") !== "synthetic");
       if ([401, 403].includes(response.status)) throw new ReadError("auth", response.status);
       if (response.status === 409) throw new ReadError("conflict");
       if (response.status === 429) throw new ReadError("rate");
@@ -152,7 +276,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   }
 
   async function allPages(view, current) {
-    let cursor = null, version = null, asOf = null, previousKey = null;
+    let cursor = null, version = null, asOf = null, previousKey = null, metadata = null;
     const rows = [], cursors = new Set(), ids = new Set();
     for (let index = 0; index < MAX_PAGES; index += 1) {
       const params = new URLSearchParams({ view, limit: String(PAGE_LIMIT), hours: "24" });
@@ -164,7 +288,9 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
           || typeof pageResult.has_more !== "boolean") throw new ReadError("invalid");
       const pageVersion = pageResult.metadata.view_version;
       version = version ?? pageVersion; asOf = asOf ?? pageResult.as_of;
-      if (version !== pageVersion || asOf !== pageResult.as_of) throw new ReadError("conflict");
+      metadata = metadata ?? pageResult.metadata;
+      if (version !== pageVersion || asOf !== pageResult.as_of
+          || metadataSignature(metadata) !== metadataSignature(pageResult.metadata)) throw new ReadError("conflict");
       for (const row of pageResult.receptions) {
         if (!validRow(row) || ids.has(row.id)) throw new ReadError("invalid");
         const active = ["waiting", "called", "absent"].includes(row.status);
@@ -175,7 +301,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       }
       if (!pageResult.has_more) {
         if (pageResult.next_cursor !== null) throw new ReadError("invalid");
-        return { rows, version };
+        return { rows, version, metadata };
       }
       cursor = pageResult.next_cursor;
       if (pageResult.receptions.length === 0 || typeof cursor !== "string" || !cursor.length
@@ -193,27 +319,64 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   }
 
   function renderRows(id, rows) {
-    get(id).replaceChildren(...rows.map(row => {
+    const view = id === "active-list" ? "active" : "recently_seated";
+    const list = get(id), retained = new Set(rows.map(row => `${view}:${row.id}`));
+    for (const [key, entry] of rowNodes) {
+      if (entry.view === view && !retained.has(key)) {
+        list.removeChild(entry.item); rowNodes.delete(key);
+      }
+    }
+    rows.forEach((row, index) => {
+      const key = `${view}:${row.id}`, signature = rowSignature(row), previous = rowNodes.get(key);
+      if (previous?.signature === signature) {
+        if (list.children[index] !== previous.item) list.insertBefore(previous.item, list.children[index] ?? null);
+        return;
+      }
       const item = element("li", undefined, "reception-row");
-      const button = element("button", numberText(row.display_number), "ticket");
+      item.dataset.receptionId = row.id;
+      const button = element("button", undefined, "ticket");
+      const parts = /^(\d{4})(\d{2})(\d{2})-(\d+)$/.exec(row.display_number);
+      if (parts) button.append(element("span", `${parts[4]}番`, "ticket-main"), element("span", `${parts[1]}/${parts[2]}/${parts[3]}`, "ticket-date"));
+      else button.textContent = row.display_number;
       button.type = "button";
       button.setAttribute("aria-label", `${numberText(row.display_number)}の詳細を確認`);
       button.addEventListener("click", () => { void openDetail(row.id); });
-      item.append(button, element("span", `受付 ${timeText(row.received_at)}`, "row-time"),
+      const time = element("span", undefined, "row-time");
+      if (view === "recently_seated") time.append(element("span", `案内 ${timeText(row.valid_seating_event.occurred_at)}`));
+      time.append(element("span", `受付 ${timeText(row.received_at)}`));
+      const trigger = element("button", "⋯", "menu-toggle");
+      trigger.type = "button";
+      trigger.setAttribute("aria-label", `${numberText(row.display_number)}の閲覧専用メニュー`);
+      trigger.setAttribute("aria-expanded", "false"); trigger.setAttribute("aria-controls", "row-menu");
+      const entry = { key, view, row, signature, item, button, trigger };
+      rowNodes.set(entry.key, entry);
+      trigger.addEventListener("click", () => {
+        if (menuEntry === entry) closeMenu({ restoreFocus: true }); else openMenu(entry);
+      });
+      bindRowGestures(entry);
+      item.append(button, time,
         element("span", `大人 ${row.adults}名 · 子供 ${row.children}名`, "row-party"),
-        element("span", LABELS[row.status], `status-label ${row.status}`));
-      return item;
-    }));
+        element("span", LABELS[row.status], `status-label ${row.status}`), trigger);
+      list.insertBefore(item, list.children[index] ?? null);
+      if (previous) list.removeChild(previous.item);
+    });
   }
 
   async function refresh() {
     if (!started || paused || logoutPending || needsLogin || page !== "receptions") return false;
-    abortReads();
+    // A valid, previously verified read-only view remains usable while polling.
+    // Failed/expired/inconsistent responses still erase it below. Never use this
+    // preserved menu as authorization for a future write operation.
+    const background = canBrowse();
+    abortReads({ preserveInteraction: background });
     const version = refreshVersion, authentication = authVersion;
     const current = () => started && !paused && !logoutPending && version === refreshVersion && authentication === authVersion;
-    disabled("refresh-button", true);
-    if (get("staff-view")) get("staff-view").dataset.state = "loading";
-    message(authenticated ? "更新しています。表示中の内容は前回取得した情報です。" : "セッションを確認しています…");
+    if (!background) {
+      disabled("refresh-button", true);
+      disabled("active-tab", true); disabled("recent-tab", true);
+      if (get("staff-view")) get("staff-view").dataset.state = "loading";
+      message("セッションと最新情報を確認しています…");
+    }
     try {
       const began = now();
       const session = await request("/staff/session");
@@ -222,17 +385,31 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       const active = await allPages("active", current);
       const recent = await allPages("recently_seated", current);
       if (!current()) return false;
-      if (active.version !== recent.version) throw new ReadError("conflict");
+      if (active.version !== recent.version
+          || metadataSignature(active.metadata) !== metadataSignature(recent.metadata)) throw new ReadError("conflict");
       const activeIds = new Set(active.rows.map(row => row.id));
       if (recent.rows.some(row => activeIds.has(row.id))) throw new ReadError("invalid");
-      if (displayedVersion !== null && displayedVersion !== active.version) closeDetail();
-      if (displayedVersion === null || JSON.stringify(activeRows) !== JSON.stringify(active.rows)) renderRows("active-list", active.rows);
-      if (displayedVersion === null || JSON.stringify(recentRows) !== JSON.stringify(recent.rows)) renderRows("recent-list", recent.rows);
-      activeRows = active.rows; recentRows = recent.rows; displayedVersion = active.version;
+      const configurationChanged = displayedMetadata !== null
+        && metadataSignature(displayedMetadata) !== metadataSignature(active.metadata);
+      const nextRows = new Map([...active.rows.map(row => [`active:${row.id}`, row]),
+        ...recent.rows.map(row => [`recently_seated:${row.id}`, row])]);
+      const unchanged = entry => entry && !configurationChanged
+        && nextRows.has(entry.key) && rowSignature(nextRows.get(entry.key)) === entry.signature;
+      if ((menuEntry && !unchanged(menuEntry)) || (gesture && !unchanged(gesture.entry))) closeMenu();
+      if (detailTarget && !unchanged(detailTarget)) closeDetail();
+      const scroll = get("reception-scroll"), top = scroll?.scrollTop, left = scroll?.scrollLeft;
+      renderRows("active-list", active.rows);
+      renderRows("recent-list", recent.rows);
+      // Restore the position at COMMIT time, not the position at request start:
+      // staff may have scrolled while the network request was in progress.
+      if (scroll && scroll.scrollTop !== top) scroll.scrollTop = top;
+      if (scroll && scroll.scrollLeft !== left) scroll.scrollLeft = left;
+      displayedMetadata = active.metadata; displayedVersion = active.version;
       for (const status of ["waiting", "called", "absent"]) text(`${status}-count`, String(active.rows.filter(row => row.status === status).length));
       hidden("active-empty", active.rows.length > 0); hidden("recent-empty", recent.rows.length > 0);
       hidden("staff-view", false);
       get("staff-view").dataset.state = "current";
+      disabled("active-tab", false); disabled("recent-tab", false); applyTabs();
       text("updated-at", `${new Date(now()).toLocaleTimeString("ja-JP", { timeZone: "Asia/Tokyo" })} に全件取得 · 5秒ごとに更新`);
       message("");
       return true;
@@ -259,15 +436,18 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
 
   async function openDetail(id) {
     if (!authenticated || paused || logoutPending || !UUID.test(id) || displayedVersion === null) return false;
-    closeDetail();
+    closeMenu(); closeDetail();
+    detailReturnTarget = rowNodes.get(`${selectedTab}:${id}`)?.button ?? null;
     const version = detailVersion, authentication = authVersion, listVersion = displayedVersion;
     const current = () => started && !paused && !logoutPending && authenticated && version === detailVersion && authentication === authVersion;
     try {
-      const result = await request(`/staff/receptions/${encodeURIComponent(id)}/operation-context`);
+      const result = await request(`/staff/receptions/${encodeURIComponent(id)}/operation-context`, { purpose: "detail" });
       if (!current()) return false;
       if (!validMetadata(result?.metadata) || !validRow(result.reception) || result.reception.id !== id) throw new ReadError("invalid");
-      if (result.metadata.view_version !== listVersion || displayedVersion !== listVersion) throw new ReadError("conflict");
+      if (result.metadata.view_version !== listVersion || displayedVersion !== listVersion
+          || metadataSignature(result.metadata) !== metadataSignature(displayedMetadata)) throw new ReadError("conflict");
       const row = result.reception, metadata = result.metadata;
+      detailTarget = { key: `${selectedTab}:${id}`, signature: rowSignature(row) };
       const fields = element("dl", undefined, "detail-fields");
       const add = (label, value) => fields.append(element("dt", label), element("dd", String(value ?? "—")));
       add("受付番号", numberText(row.display_number)); add("受付日時", timeText(row.received_at));
@@ -405,12 +585,59 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   function submit(event) { void login(event); }
   function refreshClick() { void refresh(); }
   function logoutClick() { void logout(); }
+  function activeTabClick() { selectTab("active"); }
+  function recentTabClick() { selectTab("recently_seated"); }
+  function tabKey(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) || !canBrowse()) return;
+    event.preventDefault();
+    selectTab(event.key === "Home" ? "active" : event.key === "End" ? "recently_seated"
+      : selectedTab === "active" ? "recently_seated" : "active", { focus: true });
+  }
+  function menuCloseClick() { closeMenu({ restoreFocus: true }); }
+  function detailCloseClick() { closeDetail({ restoreFocus: true }); }
+  function keyDown(event) {
+    if (event.key !== "Escape") return;
+    if (menuEntry) { event.preventDefault(); closeMenu({ restoreFocus: true }); }
+    else if (get("detail-view") && !get("detail-view").hidden) { event.preventDefault(); closeDetail({ restoreFocus: true }); }
+  }
+  function pointerDown(event) {
+    if (["touch", "pen"].includes(event.pointerType)) {
+      pointers.add(event.pointerId);
+      if (pointers.size > 1 || event.isPrimary === false) gesture = null;
+    }
+    if (menuEntry && !get("row-menu").contains(event.target) && !menuEntry.trigger.contains(event.target)) closeMenu();
+  }
+  function pointerEnd(event) {
+    pointers.delete(event.pointerId);
+    if (gesture && (event.type === "pointercancel" || !gesture.entry.item.contains(event.target))) {
+      suppressClickUntil = now() + 500; gesture = null;
+    }
+  }
+  function suppressClick(event) {
+    if (event.detail !== 0 && now() < suppressClickUntil) {
+      event.preventDefault(); event.stopImmediatePropagation();
+    }
+  }
+  function focusIn(event) {
+    if (menuEntry && !get("row-menu").contains(event.target) && event.target !== menuEntry.trigger) closeMenu();
+  }
+  function listScroll() { closeMenu(); }
   get("login-form")?.addEventListener("submit", submit);
   get("refresh-button")?.addEventListener("click", refreshClick);
   get("logout-button")?.addEventListener("click", logoutClick);
-  get("detail-close")?.addEventListener("click", closeDetail);
+  get("detail-close")?.addEventListener("click", detailCloseClick);
+  get("active-tab")?.addEventListener("click", activeTabClick);
+  get("recent-tab")?.addEventListener("click", recentTabClick);
+  for (const id of ["active-tab", "recent-tab"]) get(id)?.addEventListener("keydown", tabKey);
+  get("row-menu-close")?.addEventListener("click", menuCloseClick);
+  get("reception-scroll")?.addEventListener("scroll", listScroll, { passive: true });
+  doc.addEventListener("keydown", keyDown);
+  doc.addEventListener("pointerdown", pointerDown, true);
+  doc.addEventListener("pointerup", pointerEnd, true); doc.addEventListener("pointercancel", pointerEnd, true);
+  doc.addEventListener("click", suppressClick, true); doc.addEventListener("focusin", focusIn);
   doc.addEventListener("visibilitychange", visibility);
   env.addEventListener("pagehide", pause); env.addEventListener("pageshow", resume);
+  env.addEventListener("blur", closeMenu);
 
   function stop() {
     started = false; authVersion += 1; authenticated = false; csrf = ""; logoutCsrf = "";
@@ -418,11 +645,21 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     get("login-form")?.removeEventListener("submit", submit);
     get("refresh-button")?.removeEventListener("click", refreshClick);
     get("logout-button")?.removeEventListener("click", logoutClick);
-    get("detail-close")?.removeEventListener("click", closeDetail);
+    get("detail-close")?.removeEventListener("click", detailCloseClick);
+    get("active-tab")?.removeEventListener("click", activeTabClick);
+    get("recent-tab")?.removeEventListener("click", recentTabClick);
+    for (const id of ["active-tab", "recent-tab"]) get(id)?.removeEventListener("keydown", tabKey);
+    get("row-menu-close")?.removeEventListener("click", menuCloseClick);
+    get("reception-scroll")?.removeEventListener("scroll", listScroll);
+    doc.removeEventListener("keydown", keyDown);
+    doc.removeEventListener("pointerdown", pointerDown, true);
+    doc.removeEventListener("pointerup", pointerEnd, true); doc.removeEventListener("pointercancel", pointerEnd, true);
+    doc.removeEventListener("click", suppressClick, true); doc.removeEventListener("focusin", focusIn);
     doc.removeEventListener("visibilitychange", visibility);
     env.removeEventListener("pagehide", pause); env.removeEventListener("pageshow", resume);
+    env.removeEventListener("blur", closeMenu);
   }
-  return { start, stop, refresh, login, logout, openDetail, closeDetail };
+  return { start, stop, refresh, login, logout, openDetail, closeDetail, selectTab };
 }
 
 if (typeof document !== "undefined" && document.body?.dataset.staffPage) {

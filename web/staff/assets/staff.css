@@ -51,8 +51,68 @@ input { width: 100%; min-height: 52px; padding: .65rem; border: 1px solid #829c9
 .detail-fields { display: grid; grid-template-columns: minmax(160px, 1fr) 3fr; gap: .65rem 1rem; }
 .detail-fields dt { color: var(--muted); font-size: .9rem; }
 .detail-fields dd { margin: 0; overflow-wrap: anywhere; }
-#staff-view[data-state="loading"] .reception-list { opacity: .7; }
 footer { padding: 1rem 1.25rem 2rem; text-align: center; color: var(--muted); font-size: .8rem; }
+/* Staff dashboard only: login and customer layouts are independent. */
+body[data-staff-page="receptions"] { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+body[data-staff-page="receptions"] .app-header { min-height: 56px; flex: 0 0 auto; padding: 6px 16px; }
+body[data-staff-page="receptions"] .brand-mark { width: 32px; height: 32px; }
+body[data-staff-page="receptions"] .staff-main { flex: 1 1 0; min-height: 0; width: 100%; max-width: 1440px; margin: 0 auto; padding: 10px 16px 8px; display: flex; flex-direction: column; gap: 6px; }
+body[data-staff-page="receptions"] h1 { font-size: 1.35rem; }
+body[data-staff-page="receptions"] .page-heading { flex: 0 0 auto; }
+body[data-staff-page="receptions"] button { min-height: 44px; }
+body[data-staff-page="receptions"] .secondary { padding: 6px 12px; }
+/* Status and last-check time share a reserved slot; polling never inserts a
+   loading paragraph above the list. Long errors scroll inside this slot. */
+.update-status { height: 44px; flex: 0 0 44px; display: grid; min-width: 0; }
+.update-status > p { grid-area: 1 / 1; max-height: 44px; overflow: auto; }
+body[data-staff-page="receptions"] .updated { margin: 0; font-size: .75rem; align-self: center; font-variant-numeric: tabular-nums; }
+body[data-staff-page="receptions"] .message { margin: 0; padding: 6px 10px; flex: 0 0 auto; }
+#staff-view { position: relative; min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; gap: 6px; }
+body[data-staff-page="receptions"] .summary-grid { flex: 0 0 auto; gap: 8px; margin: 0; }
+body[data-staff-page="receptions"] .summary { display: flex; align-items: baseline; gap: 6px; padding: 5px 14px; border-top-width: 3px; }
+body[data-staff-page="receptions"] .summary p { margin: 0 auto 0 0; }
+body[data-staff-page="receptions"] .summary strong { font-size: 1.6rem; margin: 0; line-height: 1.3; }
+.list-tabs { display: flex; gap: 6px; flex: 0 0 auto; }
+.list-tabs [role="tab"] { padding: 6px 18px; color: var(--muted); background: white; border-color: var(--line); font-weight: 650; }
+.list-tabs [aria-selected="true"] { color: white; background: var(--accent); border-color: var(--accent); }
+.list-help { margin: 0; color: var(--muted); font-size: .75rem; flex: 0 0 auto; }
+.synthetic-preview { margin: 0; padding: 2px 10px; background: #fff0d6; color: #795114; border-radius: 5px; font-size: .75rem; flex: 0 0 auto; }
+.reception-scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-anchor: none; overscroll-behavior-y: contain; scroll-padding-top: 64px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); scrollbar-gutter: stable; }
+body[data-staff-page="receptions"] .reception-panel { margin: 0; padding: 0; }
+.list-caption { position: sticky; top: 0; z-index: 1; height: 32px; display: flex; align-items: center; padding: 4px 12px; margin: 0; font-size: .85rem; background: #eef3f1; }
+.list-caption .order-note { margin-left: 10px; }
+.list-columns, body[data-staff-page="receptions"] .reception-row { display: grid; grid-template-columns: minmax(160px, 1.3fr) minmax(155px, 1.1fr) minmax(140px, 1fr) 86px 52px; column-gap: 12px; align-items: center; }
+.list-columns { position: sticky; top: 32px; z-index: 1; min-height: 28px; padding: 4px 12px; font-size: .72rem; color: var(--muted); background: #f8faf9; border-bottom: 1px solid var(--line); }
+body[data-staff-page="receptions"] .reception-list { margin: 0; padding: 0; }
+body[data-staff-page="receptions"] .reception-row { min-height: 60px; padding: 3px 12px; gap: 0 12px; border-top: 0; border-bottom: 1px solid var(--line); touch-action: pan-y pinch-zoom; }
+.reception-row[data-menu-open="true"] { background: #eaf4f0; box-shadow: inset 4px 0 var(--accent); }
+body[data-staff-page="receptions"] .ticket { display: flex; flex-direction: column; align-items: flex-start; justify-content: center; min-width: 96px; padding: 1px 8px; line-height: 1.2; background: transparent; border-color: transparent; }
+.ticket-main { font-size: 1.18rem; font-weight: 750; }
+.ticket-date { font-size: .7rem; color: var(--muted); font-weight: 500; }
+body[data-staff-page="receptions"] .row-time { display: flex; flex-direction: column; font-size: .78rem; line-height: 1.45; }
+body[data-staff-page="receptions"] .row-party { white-space: nowrap; font-size: .85rem; }
+.menu-toggle { width: 48px; padding: 0; font-size: 1.5rem; font-weight: 700; color: var(--ink); background: white; }
+.row-menu { position: absolute; z-index: 5; right: 8px; bottom: 8px; width: min(390px, calc(100% - 16px)); max-height: calc(100% - 16px); overflow-y: auto; padding: 16px; box-shadow: 0 8px 32px #18343d38; border: 2px solid #86b3a7; }
+.row-menu h2 { font-size: 1rem; }
+.row-menu p { margin: 8px 0; }
+.preview-note { font-size: .85rem; color: #5c4b26; background: #fff5d8; padding: 8px; border-radius: 6px; }
+.preview-actions { margin: 8px 0 0; padding-left: 1.3rem; color: var(--muted); }
+body[data-staff-page="receptions"] .detail-panel { position: absolute; z-index: 4; inset: 4px; overflow: auto; padding: 16px; box-shadow: 0 8px 32px #18343d38; }
+body[data-staff-page="receptions"] footer { padding: 3px 12px; flex: 0 0 auto; font-size: .7rem; }
+@media (max-width: 900px) {
+  .list-columns, body[data-staff-page="receptions"] .reception-row { grid-template-columns: minmax(140px, 1.1fr) minmax(135px, 1fr) 126px 72px 48px; column-gap: 6px; }
+}
+@media (max-width: 620px) {
+  /* Keep one group per row; a narrow phone may scroll horizontally as well. */
+  body[data-staff-page="receptions"] .summary { padding: 4px 6px; gap: 3px; }
+  body[data-staff-page="receptions"] .summary p { font-size: .75rem; }
+  body[data-staff-page="receptions"] .reception-panel { min-width: 600px; }
+  body[data-staff-page="receptions"] .staff-main { padding: 6px 8px; }
+}
+@media (max-height: 540px) {
+  body[data-staff-page="receptions"] { min-height: 420px; overflow-y: auto; }
+  body[data-staff-page="receptions"] .reception-scroll { min-height: 120px; }
+}
 @media (max-width: 760px) {
   .brand-caption { display: none; }
   .app-header { padding: .8rem 1rem; }
@@ -61,11 +121,6 @@ footer { padding: 1rem 1.25rem 2rem; text-align: center; color: var(--muted); fo
   .summary-grid { gap: .5rem; }
   .summary { padding: .7rem; }
   .summary strong { font-size: 1.8rem; }
-  .reception-row { grid-template-columns: 1fr auto; gap: .4rem .7rem; }
-  .ticket { grid-column: 1; }
-  .row-time { grid-column: 1; grid-row: 2; }
-  .row-party { grid-column: 1; grid-row: 3; }
-  .status-label { grid-column: 2; grid-row: 1 / 4; }
   .detail-fields { grid-template-columns: 1fr; gap: .15rem; }
   .detail-fields dd { margin-bottom: .7rem; }
 }

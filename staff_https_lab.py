@@ -129,6 +129,12 @@ class ReadOnlyLab:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        async def preview_send(message):
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []),
+                                                  (b"x-omachi-preview", b"synthetic")]}
+            await send(message)
+
         if scope["type"] == "http":
             path, method = scope.get("path", ""), scope.get("method", "")
             allowed = path.startswith("/staff/") and (
@@ -140,9 +146,9 @@ class ReadOnlyLab:
 
                 response = JSONResponse({"detail": "合成データの閲覧専用環境です。"}, status_code=403,
                                         headers={"Cache-Control": "no-store"})
-                await response(scope, receive, send)
+                await response(scope, receive, preview_send)
                 return
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, preview_send)
 
 
 @contextmanager

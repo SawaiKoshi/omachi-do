@@ -98,6 +98,7 @@ def test_synthetic_preview_is_disposable_readonly_v2_legacy(monkeypatch):
             assert not app.app.state.predictor.available
             login = client.post("/staff/session", headers={"Origin": ORIGIN, "X-Staff-Token": TOKEN})
             assert login.status_code == 200
+            assert login.headers["x-omachi-preview"] == "synthetic"
             for flag in ("Secure", "HttpOnly", "SameSite=strict"):
                 assert flag in login.headers["set-cookie"]
             active = client.get("/staff/receptions").json()
