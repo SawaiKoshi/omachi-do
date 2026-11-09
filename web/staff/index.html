@@ -15,10 +15,14 @@
   </header>
   <main class="staff-main">
     <p id="synthetic-preview" class="synthetic-preview" hidden>開発専用・合成データのみ</p>
-    <div class="page-heading"><h1>受付状況 <span class="readonly">共有認証・閲覧のみ</span></h1><button id="refresh-button" class="secondary" type="button" disabled>最新情報を取得</button></div>
-    <div class="update-status">
+    <div class="page-heading"><h1>受付状況 <span id="staff-access-label" class="readonly">共有認証・閲覧のみ</span></h1><button id="refresh-button" class="secondary" type="button" disabled>最新情報を取得</button></div>
+    <div id="update-status" class="update-status">
       <p id="status-message" class="message" role="status" aria-live="polite">セッションを確認しています…</p>
       <p id="updated-at" class="updated" hidden>まだ更新されていません</p>
+      <div id="call-success-view" class="call-success" role="status" aria-live="polite" aria-atomic="true" hidden>
+        <span id="call-success-message"></span>
+        <button id="call-success-close" type="button" class="secondary" aria-label="成功通知を閉じる">閉じる</button>
+      </div>
     </div>
     <div id="staff-view" hidden>
       <section class="summary-grid" aria-label="未案内受付の内訳">
@@ -30,7 +34,7 @@
         <button id="active-tab" type="button" role="tab" aria-selected="true" aria-controls="active-panel" tabindex="0" disabled>未案内一覧</button>
         <button id="recent-tab" type="button" role="tab" aria-selected="false" aria-controls="recent-panel" tabindex="-1" disabled>最近の案内履歴</button>
       </div>
-      <p class="list-help">番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー</p>
+      <p id="staff-list-help" class="list-help">番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー</p>
       <div id="reception-scroll" class="reception-scroll" tabindex="0" role="region" aria-label="受付一覧のスクロール領域">
       <section id="active-panel" class="reception-panel" role="tabpanel" aria-labelledby="active-tab">
         <h2 id="active-title" class="list-caption">未案内のお客様 <span class="order-note">元の受付順</span></h2>
@@ -48,7 +52,7 @@
       <aside id="row-menu" class="row-menu panel" role="region" aria-labelledby="row-menu-title" tabindex="-1" hidden>
         <div class="section-heading"><h2 id="row-menu-title">受付メニュー</h2><button id="row-menu-close" type="button" class="secondary">閉じる</button></div>
         <p id="row-menu-status"></p>
-        <p class="preview-note">閲覧専用プレビューです。ここから操作は実行できません。</p>
+        <p id="row-menu-note" class="preview-note">閲覧専用プレビューです。ここから操作は実行できません。</p>
         <ul id="row-menu-items" class="preview-actions"></ul>
       </aside>
       <section id="detail-view" class="panel detail-panel" aria-labelledby="detail-title" hidden>
@@ -57,8 +61,26 @@
         <div id="detail-content"></div>
       </section>
     </div>
+    <section id="call-status-view" class="call-status" role="status" aria-live="polite" hidden>
+      <p id="call-status-message"></p>
+      <small id="call-operation-id"></small>
+      <div class="call-recovery-actions">
+        <button id="call-lookup" type="button" class="secondary" hidden>同じ操作IDの結果を照会</button>
+        <button id="call-retry" type="button" class="secondary" hidden>同じID・同じ内容で再送</button>
+      </div>
+    </section>
+    <div id="call-backdrop" class="call-backdrop" aria-hidden="true" hidden></div>
+    <section id="call-confirmation" class="call-confirmation panel" role="dialog" aria-modal="true" aria-labelledby="call-confirm-title" hidden>
+      <h2 id="call-confirm-title">呼出の確認（合成データ限定）</h2>
+      <p>対象を確認してください。確定直前にも最新状態を確認します。</p>
+      <div id="call-confirm-fields"></div>
+      <div class="call-confirm-actions">
+        <button id="call-dismiss" type="button" class="secondary">キャンセル</button>
+        <button id="call-confirm" type="button" class="primary" disabled>呼出を確定</button>
+      </div>
+    </section>
     <noscript><p class="message">認証を確認できないため受付情報を表示しません。JavaScriptを有効にしてください。</p></noscript>
   </main>
-  <footer>閲覧専用 · 状態変更・訂正・通知は未接続です。</footer>
+  <footer id="staff-footer">閲覧専用 · 状態変更・訂正・通知は未接続です。</footer>
 </body>
 </html>

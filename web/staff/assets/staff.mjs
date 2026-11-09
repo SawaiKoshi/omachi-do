@@ -1,4 +1,5 @@
-// Staff read-only UI. Credentials and CSRF live only in request-local memory.
+// Staff reads plus explicitly gated synthetic call lab. Secrets stay in memory.
+import { callLabResponse, callLabMetadata, createStaffCall } from './staff-call.mjs';
 const POLL_INTERVAL = 5_000;
 const REQUEST_TIMEOUT = 15_000;
 const PAGE_LIMIT = 100;
@@ -83,6 +84,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   let displayedVersion = null, displayedMetadata = null, detailTarget = null;
   let selectedTab = "active", menuEntry = null, gesture = null;
   let detailReturnTarget = null;
+  let callUI = null, callEnabled = false;
   let suppressClickUntil = 0;
   const pointers = new Set(), rowNodes = new Map(), scrollPositions = { active: 0, recently_seated: 0 };
   const controllers = new Map();
@@ -90,6 +92,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   const hidden = (id, value) => { if (get(id) && get(id).hidden !== value) get(id).hidden = value; };
   const disabled = (id, value) => { if (get(id) && get(id).disabled !== value) get(id).disabled = value; };
   const message = (value, login = false) => {
+    if (value && !login) callUI?.clearSuccess();
     const id = login ? "login-message" : "status-message";
     text(id, value); hidden(id, !value);
     if (!login) hidden("updated-at", Boolean(value));
@@ -141,8 +144,19 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     text("row-menu-status", `現在状態：${LABELS[entry.row.status]}`);
     const actions = Array.isArray(entry.row.allowed_actions)
       ? [...new Set(entry.row.allowed_actions)].filter(action => typeof action === "string" && Object.hasOwn(ACTION_LABELS, action)) : [];
-    get("row-menu-items").replaceChildren(...(actions.length ? actions.map(action => element("li", `${ACTION_LABELS[action]}（未接続・実行不可）`))
-      : [element("li", "この受付に利用可能な操作項目はありません。") ]));
+    get("row-menu-items").replaceChildren(...(actions.length ? actions.map(action => {
+      const item = element("li");
+      if (action === "call" && callUI?.canStart(entry.row)) {
+        const button = element("button", "呼出を確認", "primary"); button.type = "button";
+        button.addEventListener("click", () => { closeMenu(); void callUI.prepare(entry.row, () => {
+          if (canBrowse() && rowNodes.get(entry.key) === entry) entry.trigger.focus();
+        }); });
+        item.append(button);
+      } else item.textContent = `${ACTION_LABELS[action]}（未接続・実行不可）`;
+      return item;
+    }) : [element("li", "この受付に利用可能な操作項目はありません。") ]));
+    text("row-menu-note", callEnabled ? "合成ラボ限定です。呼出は確認画面を経由します。他の操作は実行できません。"
+      : "閲覧専用プレビューです。ここから操作は実行できません。");
     hidden("row-menu", false); get("row-menu").focus();
     return true;
   }
@@ -191,6 +205,8 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   }
 
   function clearData() {
+    callEnabled = false;
+    callUI?.suspend();
     closeMenu(); pointers.clear(); rowNodes.clear(); selectedTab = "active"; applyTabs();
     scrollPositions.active = 0; scrollPositions.recently_seated = 0;
     if (get("reception-scroll")) get("reception-scroll").scrollTop = 0;
@@ -223,7 +239,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     message(value, page === "login");
   }
 
-  async function request(path, { method = "GET", headers = {}, purpose = "refresh" } = {}) {
+  async function request(path, { method = "GET", headers = {}, purpose = "refresh", proof } = {}) {
     if (!secureOrigin()) throw new ReadError("insecure");
     const controller = new env.AbortController();
     controllers.set(controller, purpose);
@@ -239,6 +255,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
         referrerPolicy: "no-referrer", signal: controller.signal, headers: { Accept: "application/json", ...headers },
       }), interrupted]);
       hidden("synthetic-preview", response.headers?.get("X-Omachi-Preview") !== "synthetic");
+      if (proof) proof.call = proof.call && callLabResponse(response);
       if ([401, 403].includes(response.status)) throw new ReadError("auth", response.status);
       if (response.status === 409) throw new ReadError("conflict");
       if (response.status === 429) throw new ReadError("rate");
@@ -275,13 +292,13 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     }
   }
 
-  async function allPages(view, current) {
+  async function allPages(view, current, proof) {
     let cursor = null, version = null, asOf = null, previousKey = null, metadata = null;
     const rows = [], cursors = new Set(), ids = new Set();
     for (let index = 0; index < MAX_PAGES; index += 1) {
       const params = new URLSearchParams({ view, limit: String(PAGE_LIMIT), hours: "24" });
       if (cursor !== null) params.set("cursor", cursor);
-      const pageResult = await request("/staff/receptions?" + params.toString());
+      const pageResult = await request("/staff/receptions?" + params.toString(), { proof });
       if (!current()) throw new ReadError("cancelled");
       if (!validMetadata(pageResult?.metadata) || pageResult.view !== view || !timestamp(pageResult.as_of)
           || !Array.isArray(pageResult.receptions) || pageResult.receptions.length > PAGE_LIMIT
@@ -346,7 +363,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       time.append(element("span", `受付 ${timeText(row.received_at)}`));
       const trigger = element("button", "⋯", "menu-toggle");
       trigger.type = "button";
-      trigger.setAttribute("aria-label", `${numberText(row.display_number)}の閲覧専用メニュー`);
+      trigger.setAttribute("aria-label", `${numberText(row.display_number)}の受付メニュー`);
       trigger.setAttribute("aria-expanded", "false"); trigger.setAttribute("aria-controls", "row-menu");
       const entry = { key, view, row, signature, item, button, trigger };
       rowNodes.set(entry.key, entry);
@@ -370,6 +387,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     const background = canBrowse();
     abortReads({ preserveInteraction: background });
     const version = refreshVersion, authentication = authVersion;
+    const proof = { call: true };
     const current = () => started && !paused && !logoutPending && version === refreshVersion && authentication === authVersion;
     if (!background) {
       disabled("refresh-button", true);
@@ -379,11 +397,11 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     }
     try {
       const began = now();
-      const session = await request("/staff/session");
+      const session = await request("/staff/session", { proof });
       if (!current()) return false;
       acceptSession(session, began);
-      const active = await allPages("active", current);
-      const recent = await allPages("recently_seated", current);
+      const active = await allPages("active", current, proof);
+      const recent = await allPages("recently_seated", current, proof);
       if (!current()) return false;
       if (active.version !== recent.version
           || metadataSignature(active.metadata) !== metadataSignature(recent.metadata)) throw new ReadError("conflict");
@@ -409,6 +427,25 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       hidden("active-empty", active.rows.length > 0); hidden("recent-empty", recent.rows.length > 0);
       hidden("staff-view", false);
       get("staff-view").dataset.state = "current";
+      if (proof.call && callLabMetadata(active.metadata)) {
+        callEnabled = true;
+        callUI ??= createStaffCall({ document: doc, window: env, fetchImpl: fetcher, now,
+          security: () => ({ active: started && authenticated && !paused && !needsLogin && !logoutPending,
+            ready: canBrowse(), version: authVersion, csrf }), refresh,
+          authFailure: () => { lockData("認証を確認できません。未確定操作は保持しています。再ログインしてください。", { expired: true }); env.location.replace("/staff/login"); },
+          validRow, validMetadata, rowSignature, metadataSignature });
+        callUI.update({ metadata: active.metadata, rows: [...active.rows, ...recent.rows] });
+        text("staff-access-label", "共有認証・合成call限定");
+        text("staff-list-help", "番号で詳細を表示 · 右スワイプ／「⋯」から呼出を確認（合成データ限定）");
+        text("staff-footer", "開発用合成データ · 呼出のみ。案内・取消・訂正・品質審査・通知は実行できません。");
+      } else {
+        if (callEnabled) closeMenu();
+        callEnabled = false;
+        callUI?.suspend();
+        text("staff-access-label", "共有認証・閲覧のみ");
+        text("staff-list-help", "番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー");
+        text("staff-footer", "閲覧専用 · 状態変更・訂正・通知は未接続です。");
+      }
       disabled("active-tab", false); disabled("recent-tab", false); applyTabs();
       text("updated-at", `${new Date(now()).toLocaleTimeString("ja-JP", { timeZone: "Asia/Tokyo" })} に全件取得 · 5秒ごとに更新`);
       message("");
@@ -642,6 +679,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   function stop() {
     started = false; authVersion += 1; authenticated = false; csrf = ""; logoutCsrf = "";
     abortReads(); env.clearTimeout(expiryTimer); clearData(); hidden("staff-view", true);
+    callUI?.stop();
     get("login-form")?.removeEventListener("submit", submit);
     get("refresh-button")?.removeEventListener("click", refreshClick);
     get("logout-button")?.removeEventListener("click", logoutClick);

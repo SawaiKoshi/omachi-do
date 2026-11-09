@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 
 import { createStaffApp } from '../../web/staff/assets/staff.mjs';
+import { createCallJournal, CALL_JOURNAL_KEY, CALL_RECOVERY_MS } from '../../web/staff/assets/staff-call-journal.mjs';
+import { validCallReceipt } from '../../web/staff/assets/staff-call.mjs';
 
 // The browser suite deliberately provides no real browser storage, cookies, DB,
 // credentials, or network. All receipts and session responses are synthetic.
@@ -14,6 +17,10 @@ const IDS = [
   'active-empty', 'recent-empty', 'security-note',
   'active-tab', 'recent-tab', 'active-panel', 'recent-panel', 'reception-scroll',
   'row-menu', 'row-menu-title', 'row-menu-status', 'row-menu-items', 'row-menu-close', 'synthetic-preview',
+  'row-menu-note', 'staff-access-label', 'staff-list-help', 'staff-footer',
+  'call-status-view', 'call-status-message', 'call-operation-id', 'call-lookup', 'call-retry',
+  'call-backdrop', 'call-confirmation', 'call-confirm-title', 'call-confirm-fields', 'call-dismiss', 'call-confirm',
+  'update-status', 'call-success-view', 'call-success-message', 'call-success-close',
 ];
 
 class Target {
@@ -155,7 +162,8 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [], now = 0, page = 'receptions' } = {}) {
+function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [], now = 0, page = 'receptions',
+  callLab = false, storage, lockAvailable = true, locksSupported = true, lockManager } = {}) {
   const elements = new Map(IDS.map(id => [id, new Element(id)]));
   const doc = Object.assign(new Target(), {
     visibilityState: 'visible', hidden: false, activeElement: null,
@@ -168,6 +176,9 @@ function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [
     querySelectorAll() { return []; },
   });
   for (const element of elements.values()) element.ownerDocument = doc;
+  elements.get('call-success-view').hidden = true;
+  elements.get('call-success-view').append(elements.get('call-success-message'), elements.get('call-success-close'));
+  elements.get('update-status').append(elements.get('status-message'), elements.get('updated-at'), elements.get('call-success-view'));
   Object.defineProperty(doc, 'cookie', {
     get() { throw new Error('Staff UI must not inspect cookies'); },
     set() { throw new Error('Staff UI must not store shared credentials in cookies'); },
@@ -179,30 +190,44 @@ function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [
   let time = now;
   const env = Object.assign(new Target(), {
     AbortController,
+    crypto: { randomUUID },
     location: { protocol: 'https:', hostname: 'staff.localhost', origin: 'https://staff.localhost', href: 'https://staff.localhost/staff/', replace(path) { redirects.push(path); } },
     now() { return time; },
     setTimeout(handler, delay) { timerId += 1; timers.set(timerId, { handler, at: time + delay }); return timerId; },
     clearTimeout(id) { timers.delete(id); },
   });
   for (const name of ['localStorage', 'sessionStorage']) {
-    Object.defineProperty(env, name, { get() { throw new Error(`Staff UI must not use ${name}`); } });
+    Object.defineProperty(env, name, { get() {
+      if (callLab && name === 'sessionStorage' && storage) return storage;
+      throw new Error(`Staff UI must not use ${name}`);
+    } });
   }
+  if (callLab) env.navigator = locksSupported ? { locks: lockManager ?? { request: async (name, options, callback) => callback(lockAvailable ? { name } : null) } } : {};
   const fetcher = async (url, options = {}) => {
     requests.push({ url: String(url), ...options });
-    if (fetchImpl) return fetchImpl(String(url), options);
+    if (fetchImpl) {
+      const result = await fetchImpl(String(url), options);
+      if (result !== undefined) return withCapability(result);
+    }
     if (url === '/staff/session') {
-      if ((options.method ?? 'GET') === 'DELETE') return response({ authenticated: false });
-      return authenticated ? response(session()) : response({ detail: 'Unauthorized' }, 401);
+      if ((options.method ?? 'GET') === 'DELETE') return withCapability(response({ authenticated: false }));
+      return withCapability(authenticated ? response(session()) : response({ detail: 'Unauthorized' }, 401));
     }
     const parsed = new URL(String(url), env.location.origin);
     if (parsed.pathname === '/staff/receptions') {
-      return response(listing(parsed.searchParams.get('view') === 'recently_seated' ? recent : rows,
-        parsed.searchParams.get('view') ?? 'active'));
+      return withCapability(response(listing(parsed.searchParams.get('view') === 'recently_seated' ? recent : rows,
+        parsed.searchParams.get('view') ?? 'active')));
     }
     const found = [...rows, ...recent].find(row => parsed.pathname === `/staff/receptions/${row.id}/operation-context`);
-    if (found) return response({ metadata: metadata(), reception: found });
+    if (found) return withCapability(response({ metadata: metadata(), reception: found }));
     assert.fail(`Unexpected staff request: ${options.method ?? 'GET'} ${url}`);
   };
+  function withCapability(result) {
+    if (callLab && !result.headers) result.headers = { get: name => ({
+      'X-Omachi-Preview': 'synthetic', 'X-Omachi-Preview-Actions': 'call',
+    })[name] ?? null };
+    return result;
+  }
   env.fetch = fetcher;
   const controller = createStaffApp({ document: doc, fetchImpl: fetcher, window: env, now: () => time });
   return {
@@ -245,6 +270,609 @@ function assertReadOnlyRequests(requests) {
       assert.equal(headerNames.includes('x-staff-token'), false);
     }
   }
+}
+
+class CallStorage {
+  constructor() { this.values = new Map(); this.fail = false; }
+  getItem(key) { if (this.fail) throw new Error('storage unavailable'); return this.values.get(key) ?? null; }
+  setItem(key, value) { if (this.fail) throw new Error('storage unavailable'); this.values.set(key, value); }
+  removeItem(key) { if (this.fail) throw new Error('storage unavailable'); this.values.delete(key); }
+}
+
+function callReceipt(row, body, outcome = 'state_changed') {
+  const receipt = Object.fromEntries(['id', 'display_number', 'reception_order', 'received_at', 'adults', 'children',
+    'total_people', 'status', 'called_at', 'seated_at', 'cancelled_at', 'actual_wait_minutes'].map(key => [key, row[key]]));
+  receipt.snapshot = { captured_at: row.received_at, source: 'synthetic', waiting_groups: 0, ahead_groups: 0,
+    ahead_same_size_groups: 0, party_size_groups: { '1-2': 0, '3-4': 0, '5+': 0 } };
+  receipt.prediction = { status: 'model_unavailable', minutes: null, model_version: null, predicted_at: row.received_at, warnings: [] };
+  return { operation_id: body.operation_id, reception_id: row.id, action: 'call', outcome, response_status: 200,
+    recorded_at: row.called_at, resulting_revision: body.expected_revision + (outcome === 'state_changed' ? 1 : 0),
+    reception: receipt, error: null };
+}
+
+function callHarness(options = {}) {
+  const rows = options.rows ?? [reception(1, options.row ?? {})];
+  const storage = options.storage ?? new CallStorage();
+  const ledger = options.ledger ?? new Map();
+  let contexts = 0;
+  const h = harness({ ...options, rows, callLab: options.callLab ?? true, storage, fetch: async (url, request) => {
+    if (url.endsWith('/operation-context')) {
+      contexts += 1;
+      const override = await options.context?.(rows[0], contexts, url, request);
+      if (override !== undefined) return override;
+      return response({ metadata: metadata(options.meta), reception: { ...rows[0] } });
+    }
+    if (url.includes('/staff/operations/')) {
+      const override = await options.lookup?.(url, request);
+      if (override !== undefined) return override;
+      const value = ledger.get(url.split('/').at(-1));
+      return value ? response(value) : response({ detail: 'not found' }, 404);
+    }
+    if (url.endsWith('/operations') && request.method === 'POST') {
+      const body = JSON.parse(request.body);
+      assert.equal(body.action, 'call');
+      assert.deepEqual(Object.keys(body), ['operation_id', 'action', 'expected_revision', 'write_epoch']);
+      const saved = JSON.parse(storage.getItem(CALL_JOURNAL_KEY));
+      assert.deepEqual(saved.request, body, 'Fixed recovery data must be saved before sending');
+      assert.equal(request.headers['X-Staff-Token'], undefined);
+      assert.equal(request.headers['X-CSRF-Token'], session().csrf_token);
+      const overridden = await options.post?.(body, request, rows, ledger);
+      if (overridden !== undefined) return overridden;
+      if (ledger.has(body.operation_id)) return response(ledger.get(body.operation_id));
+      rows[0] = { ...rows[0], status: 'called', revision: body.expected_revision + 1, called_at: '2026-11-01T18:10:00+09:00',
+        allowed_actions: ['absent', 'seat', 'cancel'] };
+      const result = callReceipt(rows[0], body);
+      ledger.set(body.operation_id, result);
+      return response(result);
+    }
+    return options.fetch?.(url, request);
+  } });
+  const postRequests = () => h.requests.filter(r => r.method === 'POST' && r.url.endsWith('/operations'));
+  return { ...h, rows, storage, ledger, postRequests,
+    async openCall() {
+      await rowTrigger(rowItem(h)).emit('click');
+      const button = h.el('row-menu-items').children.flatMap(item => item.children).find(item => item.tagName === 'BUTTON');
+      assert.ok(button, 'Synthetic call menu must contain one confirmation action');
+      await button.emit('click'); await settle();
+    },
+    async confirmCall() { await h.el('call-confirm').emit('click'); await settle(); await settle(); },
+  };
+}
+
+for (const status of ['waiting', 'absent']) {
+  test(`synthetic call ${status}->called requires two contexts and saves a fixed UUID before one POST`, async () => {
+    const h = callHarness({ row: { status } }); await h.start();
+    await h.openCall();
+    assert.equal(h.el('call-confirmation').hidden, false);
+    assert.match(h.el('call-confirm-fields').textContent, /20261101-001.*大人 2名.*子供 1名.*呼出/s);
+    assert.equal(h.postRequests().length, 0);
+    await h.confirmCall();
+    assert.equal(h.postRequests().length, 1);
+    assert.equal(h.rows[0].status, 'called');
+    assert.equal(h.el('called-count').textContent, '1');
+    assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+    assert.match(h.el('call-success-message').textContent, /呼出成功/);
+    assert.ok(h.requests.filter(r => r.url.endsWith('/operation-context')).length >= 3);
+    h.controller.stop();
+  });
+}
+
+test('confirmed success uses the reserved slot and expires after five seconds without changing rows, menus, scroll or journal', async () => {
+  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  assert.equal(h.el('call-success-view').hidden, false);
+  assert.equal(h.el('call-status-view').hidden, true);
+  assert.equal(h.el('update-status').dataset.callNotice, 'true');
+  const item = rowItem(h), guard = h.storage.getItem('omachi.staff.call.guard.v1');
+  h.el('reception-scroll').scrollTop = 80;
+  await rowTrigger(item).emit('click');
+  const focus = h.doc.activeElement;
+  await h.tick(4_999); assert.equal(h.el('call-success-view').hidden, false);
+  await h.tick(1);
+  assert.equal(h.el('call-success-view').hidden, true);
+  assert.equal(h.el('update-status').dataset.callNotice, 'false');
+  assert.equal(rowItem(h), item); assert.equal(h.el('called-count').textContent, '1');
+  assert.equal(h.el('reception-scroll').scrollTop, 80);
+  assert.equal(h.el('row-menu').hidden, false); assert.equal(h.doc.activeElement, focus);
+  assert.equal(h.storage.getItem('omachi.staff.call.guard.v1'), guard);
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null); assert.equal(h.postRequests().length, 1);
+  await h.controller.refresh(); assert.equal(h.el('call-success-view').hidden, true);
+  h.controller.stop();
+});
+
+test('manual success dismissal only changes its display and returns keyboard focus to refresh', async () => {
+  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  const stored = [...h.storage.values], row = rowItem(h), requests = h.requests.length;
+  h.el('call-success-close').focus();
+  await h.el('call-success-close').emit('click');
+  assert.equal(h.el('call-success-view').hidden, true);
+  assert.deepEqual([...h.storage.values], stored); assert.equal(h.requests.length, requests);
+  assert.equal(rowItem(h), row); assert.equal(h.doc.activeElement, h.el('refresh-button'));
+  h.controller.stop();
+});
+
+test('a delayed successful list refresh starts the success lifetime only after all pages finish', async () => {
+  const pending = deferred(); let delay = false;
+  const h = callHarness({ post: () => { delay = true; }, fetch: url => {
+    if (delay && url.startsWith('/staff/receptions?') && new URL(url, 'https://staff.localhost').searchParams.get('view') === 'active') return pending.promise;
+  } });
+  await h.start(); await h.openCall();
+  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.tick(5_000); assert.equal(h.el('call-success-view').hidden, true);
+  delay = false; pending.resolve(response(listing(h.rows))); await sending; await settle(); await settle();
+  assert.equal(h.el('call-success-view').hidden, false);
+  await h.tick(4_999); assert.equal(h.el('call-success-view').hidden, false);
+  await h.tick(1); assert.equal(h.el('call-success-view').hidden, true); h.controller.stop();
+});
+
+test('a successful receipt with failed latest-list refresh stays a persistent review message', async () => {
+  let offline = false;
+  const h = callHarness({ post: () => { offline = true; }, fetch: url => {
+    if (offline && url.startsWith('/staff/receptions?')) throw new Error('list offline');
+  } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  assert.equal(h.el('call-success-view').hidden, true);
+  assert.match(h.el('call-status-message').textContent, /最新一覧を確認できません/);
+  await h.tick(10_000);
+  assert.equal(h.el('call-status-view').hidden, false);
+  assert.match(h.el('call-status-message').textContent, /最新一覧を確認できません/);
+  assert.equal(h.postRequests().length, 1); h.controller.stop();
+});
+
+test('a refreshed list from a different database cannot turn a historical receipt into an expiring success', async () => {
+  let switched = false;
+  const nextDatabase = randomUUID();
+  const h = callHarness({ post: () => { switched = true; }, fetch: url => {
+    if (!switched || !url.startsWith('/staff/receptions?')) return undefined;
+    const view = new URL(url, 'https://staff.localhost').searchParams.get('view');
+    return response(listing(view === 'active' ? h.rows : [], view, { metadata: metadata({ database_id: nextDatabase }) }));
+  } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.tick(10_000);
+  assert.equal(h.el('call-success-view').hidden, true);
+  assert.equal(h.el('call-status-view').hidden, false);
+  assert.match(h.el('call-status-message').textContent, /最新一覧を確認できません/);
+  assert.equal(h.postRequests().length, 1); h.controller.stop();
+});
+
+for (const failure of ['unknown', 'conflict', 'current-context']) {
+  test(`${failure} never acquires a success timer or loses recovery information`, async () => {
+    const h = callHarness({ post: () => {
+      if (failure === 'unknown') throw new Error('lost');
+      if (failure === 'conflict') return response({ detail: 'conflict' }, 409);
+    }, context: (_, count) => { if (failure === 'current-context' && count >= 3) throw new Error('context offline'); } });
+    await h.start(); await h.openCall(); await h.confirmCall();
+    const fixed = h.storage.getItem(CALL_JOURNAL_KEY);
+    assert.ok(fixed);
+    await h.tick(10_000);
+    assert.equal(h.el('call-success-view').hidden, true); assert.equal(h.el('call-status-view').hidden, false);
+    assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), fixed); assert.equal(h.postRequests().length, 1);
+    h.controller.stop();
+  });
+}
+
+test('an old success timer cannot erase the next success or a subsequent result-unknown panel', async () => {
+  let attempts = 0;
+  const h = callHarness({ post: () => { if (++attempts === 3) throw new Error('lost'); } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  const oldTimers = [...h.timers.values()].filter(timer => timer.at === h.env.now() + 5_000).map(timer => timer.handler);
+  h.rows[0] = { ...h.rows[0], status: 'absent', revision: 2, allowed_actions: ['call', 'return', 'seat', 'cancel'] };
+  await h.controller.refresh(); await h.openCall(); await h.confirmCall();
+  // Even callbacks already queued before cancellation must be harmless.
+  assert.ok(oldTimers.length); oldTimers.forEach(handler => handler()); await settle();
+  assert.equal(h.el('call-success-view').hidden, false);
+  h.rows[0] = { ...h.rows[0], status: 'absent', revision: 4, allowed_actions: ['call', 'return', 'seat', 'cancel'] };
+  await h.controller.refresh(); await h.openCall(); await h.confirmCall();
+  const fixed = h.storage.getItem(CALL_JOURNAL_KEY);
+  oldTimers.forEach(handler => handler()); await h.tick(5_000);
+  assert.equal(h.el('call-status-view').hidden, false); assert.match(h.el('call-status-message').textContent, /結果不明/);
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), fixed); h.controller.stop();
+});
+
+test('focused or hovered success remains readable and gets five seconds after interaction ends', async () => {
+  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  h.el('call-success-close').focus();
+  await h.tick(6_000); assert.equal(h.el('call-success-view').hidden, false);
+  h.el('refresh-button').focus(); await h.el('call-success-view').emit('focusout');
+  await h.el('call-success-view').emit('pointerenter');
+  await h.tick(6_000); assert.equal(h.el('call-success-view').hidden, false);
+  await h.el('call-success-view').emit('pointerleave');
+  await h.tick(5_000); assert.equal(h.el('call-success-view').hidden, true); h.controller.stop();
+});
+
+test('logout clears success presentation and queued old timers cannot revive staff information after restart', async () => {
+  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  const timers = [...h.timers.values()].filter(timer => timer.at === h.env.now() + 5_000).map(timer => timer.handler);
+  await h.controller.logout(); timers.forEach(handler => handler()); await settle();
+  assertHidden(h); assert.equal(h.el('call-success-view').hidden, true);
+  h.controller.stop();
+  const next = callHarness({ rows: h.rows, storage: h.storage }); await next.start();
+  assert.equal(next.el('call-success-view').hidden, true);
+  assert.equal(next.postRequests().length, 0); next.controller.stop();
+});
+
+test('confirmation dismissal and Escape send nothing and keyboard focus stays inside the confirmation', async () => {
+  const h = callHarness(); await h.start(); await h.openCall();
+  assert.equal(h.doc.activeElement, h.el('call-dismiss'));
+  assert.equal(h.el('call-backdrop').hidden, false);
+  await h.doc.emit('keydown', { key: 'Tab' });
+  assert.equal(h.doc.activeElement, h.el('call-confirm'));
+  await h.doc.emit('keydown', { key: 'Tab', shiftKey: true });
+  assert.equal(h.doc.activeElement, h.el('call-dismiss'));
+  await h.doc.emit('keydown', { key: 'Tab', shiftKey: true });
+  assert.equal(h.doc.activeElement, h.el('call-confirm'));
+  await h.doc.emit('keydown', { key: 'Escape' });
+  assert.equal(h.el('call-confirmation').hidden, true);
+  assert.equal(h.el('call-backdrop').hidden, true);
+  assert.equal(h.doc.activeElement, rowTrigger(rowItem(h)));
+  assert.equal(h.postRequests().length, 0);
+  await h.openCall(); await h.el('call-dismiss').emit('click');
+  assert.equal(h.postRequests().length, 0);
+  h.controller.stop();
+});
+
+test('cooperating tabs cannot hold two call locks and another tab only acquires after the owner leaves', async () => {
+  const held = new Set();
+  const lockManager = { async request(name, options, callback) {
+    assert.equal(options.ifAvailable, true);
+    if (held.has(name)) return callback(null);
+    held.add(name);
+    try { return await callback({ name }); } finally { held.delete(name); }
+  } };
+  const first = callHarness({ lockManager }), second = callHarness({ lockManager });
+  await first.start(); await second.start();
+  await first.openCall();
+  await rowTrigger(rowItem(second)).emit('click');
+  assert.equal(second.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+  first.controller.stop(); await settle();
+  const third = callHarness({ lockManager }); await third.start(); await third.openCall();
+  assert.equal(third.el('call-confirmation').hidden, false);
+  second.controller.stop(); third.controller.stop();
+});
+
+for (const change of [ { status: 'called', revision: 1 }, { revision: 1 }, { adults: 3, total_people: 4 } ]) {
+  test(`changed target before confirmation is rejected: ${JSON.stringify(change)}`, async () => {
+    const h = callHarness({ context: row => response({ metadata: metadata(), reception: { ...row, ...change } }) });
+    await h.start(); await h.openCall();
+    assert.equal(h.el('call-confirmation').hidden, true);
+    assert.equal(h.postRequests().length, 0);
+    h.controller.stop();
+  });
+}
+
+for (const change of ['revision', 'write_epoch', 'database_id', 'status']) {
+  test(`final context ${change} change invalidates confirmation before UUID storage or POST`, async () => {
+    const h = callHarness({ context: (row, count) => count === 2 ? response({ metadata: metadata(
+      ['write_epoch', 'database_id'].includes(change) ? { [change]: randomUUID() } : {}),
+    reception: { ...row, ...(change === 'revision' ? { revision: 1 } : change === 'status' ? { status: 'called' } : {}) } }) : undefined });
+    await h.start(); await h.openCall(); await h.confirmCall();
+    assert.equal(h.postRequests().length, 0);
+    assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+    assert.equal(h.el('call-confirmation').hidden, true);
+    h.controller.stop();
+  });
+}
+
+test('background target changes invalidate an open confirmation while unchanged polling preserves it', async () => {
+  const h = callHarness(); await h.start(); await h.openCall();
+  const item = rowItem(h), fields = h.el('call-confirm-fields').children[0];
+  h.el('reception-scroll').scrollTop = 120;
+  for (let i = 0; i < 25; i += 1) await h.controller.refresh();
+  assert.equal(rowItem(h), item);
+  assert.equal(h.el('call-confirm-fields').children[0], fields);
+  assert.equal(h.el('reception-scroll').scrollTop, 120);
+  assert.equal(h.el('call-confirmation').hidden, false);
+  h.rows[0] = { ...h.rows[0], revision: 1 };
+  await h.controller.refresh();
+  assert.equal(h.el('call-confirmation').hidden, true);
+  await h.confirmCall(); assert.equal(h.postRequests().length, 0);
+  h.controller.stop();
+});
+
+test('double confirm plus background five-second refresh creates one UUID and never aborts its POST', async () => {
+  const pending = deferred(); let signal;
+  const h = callHarness({ post: (body, request) => { signal = request.signal; return pending.promise; } });
+  await h.start(); await h.openCall();
+  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.el('call-confirm').emit('click');
+  await h.tick(5_000);
+  assert.equal(h.postRequests().length, 1); assert.equal(signal.aborted, false);
+  assert.match(h.el('call-status-message').textContent, /送信中/);
+  pending.reject(new Error('lost')); await sending; await settle();
+  assert.match(h.el('call-status-message').textContent, /結果不明/);
+  assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
+  h.controller.stop();
+});
+
+test('lost POST receipt is recovered by authenticated lookup and fresh context without a second POST', async () => {
+  const h = callHarness({ post: (body, _, rows, ledger) => {
+    rows[0] = { ...rows[0], status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00' };
+    ledger.set(body.operation_id, callReceipt(rows[0], body));
+    throw new Error('response lost after commit');
+  } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  assert.match(h.el('call-status-message').textContent, /結果不明/);
+  assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
+  await h.el('call-lookup').emit('click'); await settle(); await settle();
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+  assert.equal(h.postRequests().length, 1);
+  assert.equal(h.el('called-count').textContent, '1');
+  h.controller.stop();
+});
+
+for (const status of [404, 503, 'network', 409]) {
+  test(`lookup ${status} leaves unknown and new calls blocked, preserving the fixed request`, async () => {
+    const h = callHarness({ post: () => { throw new Error('lost'); }, lookup: () => {
+      if (status === 'network') throw new Error('offline');
+      return response({ detail: 'not a saved operation receipt' }, status);
+    } });
+    await h.start(); await h.openCall(); await h.confirmCall();
+    const fixed = h.storage.getItem(CALL_JOURNAL_KEY);
+    await h.el('call-lookup').emit('click'); await settle();
+    assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), fixed);
+    await rowTrigger(rowItem(h)).emit('click');
+    assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+    assert.equal(h.postRequests().length, 1);
+    h.controller.stop();
+  });
+}
+
+test('explicit retry after unknown uses byte-identical body, UUID and expected revision', async () => {
+  let attempt = 0;
+  const h = callHarness({ post: () => { if (++attempt === 1) throw new Error('lost'); } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.el('call-retry').emit('click'); await settle(); await settle();
+  assert.equal(h.postRequests().length, 2);
+  assert.equal(h.postRequests()[0].body, h.postRequests()[1].body);
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+  h.controller.stop();
+});
+
+for (const outcome of ['no_change', 'rejected']) {
+  test(`lookup HTTP200 handles saved ${outcome} separately from lookup success`, async () => {
+    const storage = new CallStorage(), ledger = new Map();
+    const row = reception(1, { status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00' });
+    const operation_id = randomUUID(), body = { operation_id, action: 'call', expected_revision: 1, write_epoch: metadata().write_epoch };
+    createCallJournal({ storage, now: () => 0 }).begin({ operation_id, reception_id: row.id, request: body, database_id: metadata().database_id });
+    ledger.set(operation_id, outcome === 'no_change' ? callReceipt(row, body, outcome) : {
+      operation_id, reception_id: row.id, action: 'call', outcome, response_status: 409,
+      recorded_at: row.called_at, resulting_revision: 1, reception: null, error: { code: 'revision_conflict', detail: 'changed' },
+    });
+    const h = callHarness({ rows: [row], storage, ledger }); await h.start(); await settle(); await settle();
+    assert.equal(h.postRequests().length, 0);
+    assert.equal(storage.getItem(CALL_JOURNAL_KEY), null);
+    assert.match(h.el(outcome === 'no_change' ? 'call-success-message' : 'call-status-message').textContent, outcome === 'no_change' ? /変更なし/ : /拒否・競合/);
+    await h.tick(10_000);
+    if (outcome === 'rejected') {
+      assert.equal(h.el('call-status-view').hidden, false);
+      assert.match(h.el('call-status-message').textContent, /拒否・競合/);
+    } else assert.equal(h.el('call-success-view').hidden, true);
+    h.controller.stop();
+  });
+}
+
+test('a generic POST409 is not a receipt and never changes revision for an automatic retry', async () => {
+  const h = callHarness({ post: () => response({ detail: 'state conflict' }, 409) });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  const fixed = JSON.parse(h.storage.getItem(CALL_JOURNAL_KEY));
+  assert.equal(fixed.request.expected_revision, 0);
+  assert.match(h.el('call-status-message').textContent, /結果不明/);
+  assert.equal(h.postRequests().length, 1); h.controller.stop();
+});
+
+test('reload/relogin restores one pending operation and looks up before allowing any new call', async () => {
+  const storage = new CallStorage(), ledger = new Map();
+  const first = callHarness({ storage, ledger, post: (body, _, rows) => {
+    rows[0] = { ...rows[0], status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00' };
+    ledger.set(body.operation_id, callReceipt(rows[0], body)); throw new Error('lost');
+  } });
+  await first.start(); await first.openCall(); await first.confirmCall();
+  const fixed = storage.getItem(CALL_JOURNAL_KEY);
+  await first.controller.logout();
+  assert.equal(storage.getItem(CALL_JOURNAL_KEY), fixed);
+  assertHidden(first);
+  first.controller.stop();
+  const second = callHarness({ storage, ledger, rows: first.rows }); await second.start(); await settle(); await settle();
+  assert.equal(second.postRequests().length, 0);
+  assert.ok(second.requests.some(r => r.url.startsWith('/staff/operations/')));
+  assert.equal(storage.getItem(CALL_JOURNAL_KEY), null);
+  second.controller.stop();
+});
+
+for (const kind of ['unavailable', 'save-failure', 'corrupt', 'partial-missing']) {
+  test(`storage ${kind} prevents all POSTs and retains a safe blocked state`, async () => {
+    const storage = new CallStorage();
+    if (kind === 'corrupt') storage.setItem(CALL_JOURNAL_KEY, '{');
+    if (kind === 'partial-missing') storage.setItem('omachi.staff.call.guard.v1', 'pending:' + randomUUID());
+    if (kind === 'unavailable') storage.fail = true;
+    const h = callHarness({ storage }); await h.start();
+    if (kind === 'save-failure') { await h.openCall(); storage.fail = true; await h.confirmCall(); }
+    else {
+      await rowTrigger(rowItem(h)).emit('click');
+      assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+    }
+    assert.equal(h.postRequests().length, 0);
+    assert.match(h.el('call-status-message').textContent, /確認|停止/);
+    h.controller.stop();
+  });
+}
+
+test('storage becoming unreadable after successful save/readback still stops the actual POST', async () => {
+  const storage = new CallStorage(); let payloadReads = 0;
+  const read = storage.getItem.bind(storage);
+  storage.getItem = key => {
+    const raw = read(key);
+    if (key === CALL_JOURNAL_KEY && raw && ++payloadReads === 2) storage.fail = true;
+    return raw;
+  };
+  const h = callHarness({ storage }); await h.start(); await h.openCall(); await h.confirmCall();
+  assert.equal(h.postRequests().length, 0);
+  assert.match(h.el('call-status-message').textContent, /確認|停止/);
+  h.controller.stop();
+});
+
+test('expired recovery discards the fixed body and never auto-sends or treats it as failed', async () => {
+  const storage = new CallStorage(), operation_id = randomUUID(), row = reception();
+  createCallJournal({ storage, now: () => 0 }).begin({ operation_id, reception_id: row.id, database_id: metadata().database_id,
+    request: { operation_id, action: 'call', expected_revision: 0, write_epoch: metadata().write_epoch } });
+  const h = callHarness({ storage, now: CALL_RECOVERY_MS }); await h.start();
+  assert.equal(JSON.parse(storage.getItem(CALL_JOURNAL_KEY)).state, 'manual');
+  assert.equal(JSON.parse(storage.getItem(CALL_JOURNAL_KEY)).request, undefined);
+  assert.equal(h.el('call-retry').hidden, true);
+  assert.equal(h.requests.filter(r => r.url.startsWith('/staff/operations/')).length, 0);
+  assert.match(h.el('call-status-message').textContent, /期限超過/);
+  h.controller.stop();
+});
+
+test('old journal from a regenerated synthetic DB cannot be resent or automatically released', async () => {
+  const storage = new CallStorage(), operation_id = randomUUID();
+  createCallJournal({ storage, now: () => 0 }).begin({ operation_id, reception_id: reception().id, database_id: randomUUID(),
+    request: { operation_id, action: 'call', expected_revision: 0, write_epoch: metadata().write_epoch } });
+  const h = callHarness({ storage }); await h.start(); await settle();
+  await h.el('call-retry').emit('click'); await settle();
+  assert.equal(h.postRequests().length, 0);
+  assert.ok(storage.getItem(CALL_JOURNAL_KEY)); h.controller.stop();
+});
+
+for (const opts of [{ callLab: false }, { lockAvailable: false }, { locksSupported: false }]) {
+  test(`non-call or unowned tab cannot offer a call: ${JSON.stringify(opts)}`, async () => {
+    const h = callHarness(opts); await h.start(); await rowTrigger(rowItem(h)).emit('click');
+    assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+    assert.equal(h.postRequests().length, 0); h.controller.stop();
+  });
+}
+
+for (const status of ['called', 'seated', 'cancelled']) {
+  test(`fresh call is never offered for ${status}`, async () => {
+    // A called active row has no call action. Terminal rows are rejected from
+    // active listings by the existing fail-closed list validation.
+    const h = callHarness({ row: { status, allowed_actions: ['seat', 'cancel'] } }); await h.start();
+    if (status === 'called') {
+      await rowTrigger(rowItem(h)).emit('click');
+      assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+    } else assertHidden(h);
+    assert.equal(h.postRequests().length, 0); h.controller.stop();
+  });
+}
+
+test('POST timeout stays unknown and its late successful response cannot overwrite the current UI', async () => {
+  const pending = deferred(); let signal, fixed;
+  const h = callHarness({ post: (body, request) => { fixed = body; signal = request.signal; return pending.promise; } });
+  await h.start(); await h.openCall();
+  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.tick(15_000); await sending; await settle();
+  assert.equal(signal.aborted, true);
+  assert.match(h.el('call-status-message').textContent, /結果不明/);
+  const row = { ...h.rows[0], status: 'called', called_at: '2026-11-01T18:10:00+09:00' };
+  pending.resolve(response(callReceipt(row, fixed))); await settle();
+  assert.equal(h.el('waiting-count').textContent, '1');
+  assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
+  assert.equal(h.postRequests().length, 1); h.controller.stop();
+});
+
+test('lookup in flight survives polling without starting another write or losing its ID', async () => {
+  const pending = deferred(); let signal;
+  const h = callHarness({ post: () => { throw new Error('lost'); }, lookup: (_, request) => { signal = request.signal; return pending.promise; } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  const checking = h.el('call-lookup').emit('click'); await settle();
+  await h.tick(5_000);
+  assert.equal(signal.aborted, false);
+  assert.equal(h.postRequests().length, 1);
+  pending.resolve(response({ detail: 'no receipt' }, 404)); await checking; await settle();
+  assert.ok(h.storage.getItem(CALL_JOURNAL_KEY)); h.controller.stop();
+});
+
+test('a received receipt with failed current-context lookup disables retry until safe lookup completes', async () => {
+  const h = callHarness({ context: (_, count) => { if (count === 3) throw new Error('context offline'); } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  assert.match(h.el('call-status-message').textContent, /受領済み/);
+  assert.equal(h.el('call-retry').hidden, true);
+  assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
+  await h.el('call-retry').emit('click'); assert.equal(h.postRequests().length, 1);
+  await h.el('call-lookup').emit('click'); await settle(); await settle();
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+  assert.equal(h.postRequests().length, 1); h.controller.stop();
+});
+
+test('the current row comes from context/list reads, even when a historical receipt says called', async () => {
+  const h = callHarness({ post: (body, _, rows, ledger) => {
+    const historical = { ...rows[0], status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00' };
+    ledger.set(body.operation_id, callReceipt(historical, body));
+    rows[0] = { ...historical, status: 'absent', revision: 2, allowed_actions: ['call', 'return', 'seat', 'cancel'] };
+    throw new Error('response lost');
+  } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.el('call-lookup').emit('click'); await settle(); await settle();
+  assert.equal(h.el('absent-count').textContent, '1');
+  assert.equal(h.el('called-count').textContent, '0');
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null); h.controller.stop();
+});
+
+test('logout during an in-flight POST hides details and retains journal despite a late response', async () => {
+  const pending = deferred(); let body;
+  const h = callHarness({ post: b => { body = b; return pending.promise; } });
+  await h.start(); await h.openCall();
+  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.controller.logout(); assertHidden(h);
+  const record = h.storage.getItem(CALL_JOURNAL_KEY);
+  assert.ok(record); assert.equal(h.el('call-status-view').hidden, true);
+  pending.resolve(response(callReceipt({ ...h.rows[0], status: 'called', called_at: '2026-11-01T18:10:00+09:00' }, body)));
+  await sending; await settle();
+  assertHidden(h); assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), record);
+  h.controller.stop();
+});
+
+for (const status of [401, 403]) {
+  test(`operation auth ${status} closes information and retains unknown for authenticated recovery`, async () => {
+    const h = callHarness({ post: () => response({ detail: 'auth failure' }, status) });
+    await h.start(); await h.openCall(); await h.confirmCall();
+    assertHidden(h); assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
+    assert.ok(h.redirects.includes('/staff/login'));
+    assert.equal(h.el('call-status-view').hidden, true); h.controller.stop();
+  });
+}
+
+test('background failure during explicit retry preflight prevents the retry POST', async () => {
+  const pending = deferred(); let listFail = false;
+  const h = callHarness({ post: () => { throw new Error('lost'); },
+    context: (_, count) => count === 3 ? pending.promise : undefined,
+    fetch: url => { if (listFail && url.startsWith('/staff/receptions?')) throw new Error('list offline'); } });
+  await h.start(); await h.openCall(); await h.confirmCall();
+  const retrying = h.el('call-retry').emit('click'); await settle();
+  listFail = true; await h.controller.refresh(); assertHidden(h);
+  pending.resolve(response({ metadata: metadata(), reception: h.rows[0] })); await retrying; await settle();
+  assert.equal(h.postRequests().length, 1);
+  assert.ok(h.storage.getItem(CALL_JOURNAL_KEY)); h.controller.stop();
+});
+
+test('missing call capability on any page leaves the general UI read-only even with a writable metadata flag', async () => {
+  const h = callHarness({ fetch: url => {
+    if (!url.startsWith('/staff/receptions?')) return undefined;
+    const view = new URL(url, 'https://staff.localhost').searchParams.get('view');
+    return { ...response(listing(view === 'active' ? [reception()] : [], view)), headers: { get: () => null } };
+  } });
+  await h.start(); assert.equal(h.postRequests().length, 0);
+  assert.equal(h.el('staff-view').hidden, false);
+  await rowTrigger(rowItem(h)).emit('click');
+  assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+  assert.equal(h.storage.getItem('omachi.staff.call.guard.v1'), null);
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null); h.controller.stop();
+});
+
+for (const mutation of [
+  r => ({ ...r, action: 'seat' }), r => ({ ...r, operation_id: randomUUID() }), r => ({ ...r, reception_id: randomUUID() }),
+  r => ({ ...r, response_status: 409 }), r => ({ ...r, resulting_revision: 0 }),
+  r => ({ ...r, outcome: 'unexpected' }), r => ({ ...r, extra: true }),
+  r => ({ ...r, reception: { ...r.reception, actual_wait_minutes: 1 } }),
+  r => ({ ...r, reception: { ...r.reception, prediction: { ...r.reception.prediction, minutes: -1 } } }),
+]) {
+  test(`a malformed saved receipt is never treated as a confirmed call: ${mutation.toString()}`, () => {
+    const body = { operation_id: randomUUID(), action: 'call', expected_revision: 0, write_epoch: metadata().write_epoch };
+    const row = reception(1, { status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00' });
+    const record = { operation_id: body.operation_id, reception_id: row.id, request: body };
+    const valid = callReceipt(row, body);
+    assert.equal(validCallReceipt(valid, record), true);
+    assert.equal(validCallReceipt(mutation(valid), record), false);
+  });
 }
 
 test('unauthenticated management startup never requests or displays reception information', async () => {
@@ -840,6 +1468,10 @@ test('dashboard status reserves height and unaffected row and summary styles do 
   assert.match(html, /class="update-status"[^>]*>\s*<p id="status-message"[^]*?<p id="updated-at"/);
   assert.match(css, /\.update-status\s*\{[^}]*height:\s*44px;[^}]*flex:\s*0 0 44px/);
   assert.match(css, /\.update-status > p\s*\{[^}]*grid-area:\s*1 \/ 1/);
+  assert.match(html, /id="update-status"[^]*?id="call-success-view"[^]*?id="call-success-close"[^]*?<div id="staff-view"/);
+  assert.match(html, /id="call-success-view"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(css, /\.call-success\s*\{[^}]*grid-area:\s*1 \/ 1;[^}]*height:\s*44px/);
+  assert.match(css, /\.call-success > span\s*\{[^}]*max-height:\s*42px;[^}]*overflow:\s*auto/);
   assert.match(css, /scrollbar-gutter:\s*stable/);
   assert.doesNotMatch(css, /data-state=["']?(?:loading|refreshing)[^}]*\}/);
   // CSS checks establish stable layout inputs; actual pixel geometry and touch

@@ -2,7 +2,7 @@
 
 The ordinary staff_https_lab remains read-only. This entry point has no DB,
 model, bind-address, worker-count or general write-enable option. The staff UI
-remains read-only; callers must use the existing authenticated operations API.
+uses the existing authenticated operations API for synthetic calls only.
 """
 
 import argparse
@@ -194,7 +194,7 @@ def synthetic_app(token, port):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Call API only; disposable synthetic HTTPS lab. UI remains read-only.")
+    parser = argparse.ArgumentParser(description="Synthetic call UI only; disposable synthetic HTTPS lab.")
     parser.add_argument("--cert", required=True, help="Development TLS certificate outside this repository")
     parser.add_argument("--key", required=True, help="Owner-only development private key outside this repository")
     parser.add_argument("--port", type=int, default=8444)
@@ -218,7 +218,7 @@ def main(argv=None):
                 print("[check_ok] TLS, credential and disposable call-only DB passed; no server started.", flush=True)
                 return 0
             print(f"Synthetic call API only: https://staff.localhost:{args.port}/staff/login", flush=True)
-            print("UI remains read-only. Run only one staff.localhost lab at a time (cookies share the host).", flush=True)
+            print("Synthetic call UI only. Run only one staff.localhost lab at a time (cookies share the host).", flush=True)
             stage = "server_startup"
             uvicorn.run(
                 app, host="127.0.0.1", port=args.port, workers=1, reload=False,

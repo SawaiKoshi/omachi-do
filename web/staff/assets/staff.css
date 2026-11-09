@@ -65,6 +65,10 @@ body[data-staff-page="receptions"] .secondary { padding: 6px 12px; }
    loading paragraph above the list. Long errors scroll inside this slot. */
 .update-status { height: 44px; flex: 0 0 44px; display: grid; min-width: 0; }
 .update-status > p { grid-area: 1 / 1; max-height: 44px; overflow: auto; }
+.call-success { grid-area: 1 / 1; z-index: 1; min-width: 0; height: 44px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; background: #eaf4f0; border: 1px solid #86b3a7; border-radius: 6px; padding-left: 10px; }
+.call-success > span { min-width: 0; max-height: 42px; overflow: auto; font-size: .9rem; line-height: 1.4; }
+#update-status[data-call-notice="true"] > #updated-at { visibility: hidden; }
+body[data-staff-page="receptions"] .call-success button { height: 44px; padding: 4px 12px; line-height: 1; white-space: nowrap; }
 body[data-staff-page="receptions"] .updated { margin: 0; font-size: .75rem; align-self: center; font-variant-numeric: tabular-nums; }
 body[data-staff-page="receptions"] .message { margin: 0; padding: 6px 10px; flex: 0 0 auto; }
 #staff-view { position: relative; min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; gap: 6px; }
@@ -97,6 +101,14 @@ body[data-staff-page="receptions"] .row-party { white-space: nowrap; font-size: 
 .row-menu p { margin: 8px 0; }
 .preview-note { font-size: .85rem; color: #5c4b26; background: #fff5d8; padding: 8px; border-radius: 6px; }
 .preview-actions { margin: 8px 0 0; padding-left: 1.3rem; color: var(--muted); }
+.preview-actions button { width: 100%; }
+.call-status { flex: 0 0 auto; max-height: min(30dvh, 210px); overflow: auto; padding: 8px 12px; border: 2px solid #b88b31; border-radius: 8px; background: #fff5d8; }
+.call-status p { margin: 0; }
+.call-status small { display: block; overflow-wrap: anywhere; }
+.call-recovery-actions, .call-confirm-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
+.call-backdrop { position: fixed; z-index: 9; inset: 0; background: #18343d66; }
+.call-confirmation { position: fixed; z-index: 10; inset: 50% auto auto 50%; transform: translate(-50%, -50%); width: min(640px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; border: 3px solid var(--accent); box-shadow: 0 8px 32px #18343d38; }
+body[data-staff-page="receptions"] .call-confirm-actions button { min-height: 56px; min-width: 160px; }
 body[data-staff-page="receptions"] .detail-panel { position: absolute; z-index: 4; inset: 4px; overflow: auto; padding: 16px; box-shadow: 0 8px 32px #18343d38; }
 body[data-staff-page="receptions"] footer { padding: 3px 12px; flex: 0 0 auto; font-size: .7rem; }
 @media (max-width: 900px) {

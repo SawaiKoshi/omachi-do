@@ -424,6 +424,16 @@ def create_app(
         require_staff_page_origin(request)
         return FileResponse(web_directory / "staff" / "assets" / "staff.mjs", media_type="text/javascript")
 
+    @app.get("/staff/assets/staff-call.mjs", include_in_schema=False)
+    def staff_call_script(request: Request):
+        require_staff_page_origin(request)
+        return FileResponse(web_directory / "staff" / "assets" / "staff-call.mjs", media_type="text/javascript")
+
+    @app.get("/staff/assets/staff-call-journal.mjs", include_in_schema=False)
+    def staff_call_journal_script(request: Request):
+        require_staff_page_origin(request)
+        return FileResponse(web_directory / "staff" / "assets" / "staff-call-journal.mjs", media_type="text/javascript")
+
     @app.get("/staff/assets/staff.css", include_in_schema=False)
     def staff_stylesheet(request: Request):
         require_staff_page_origin(request)

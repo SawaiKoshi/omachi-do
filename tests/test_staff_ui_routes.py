@@ -19,7 +19,11 @@ from staff_sessions import COOKIE_NAME, IDLE_SECONDS
 ORIGIN = "https://staff.localhost"
 CUSTOMER = "http://127.0.0.1"
 TOKEN = "synthetic-ui-shared-token-not-for-real-use-1234567890"
-UI_PATHS = ("/staff/login", "/staff/", "/staff/assets/staff.mjs", "/staff/assets/staff.css")
+STAFF_ASSET_PATHS = (
+    "/staff/assets/staff.mjs", "/staff/assets/staff-call.mjs",
+    "/staff/assets/staff-call-journal.mjs", "/staff/assets/staff.css",
+)
+UI_PATHS = ("/staff/login", "/staff/", *STAFF_ASSET_PATHS)
 
 
 @contextmanager
@@ -100,7 +104,7 @@ def test_staff_pages_and_assets_reject_cross_origin_proxy_headers_and_lan(path):
 def test_public_login_assets_and_authenticated_dashboard_have_restricted_policies():
     with ui_environment() as (database, _, client):
         before = database.read_bytes()
-        for path in ("/staff/login", "/staff/assets/staff.mjs", "/staff/assets/staff.css"):
+        for path in ("/staff/login", *STAFF_ASSET_PATHS):
             response = client.get(path)
             assert response.status_code == 200
             assert response.headers["cache-control"] == "no-store"
@@ -181,3 +185,48 @@ def test_staff_static_allowlist_does_not_expose_other_repository_files():
             response = client.get(path)
             assert response.status_code == 404
             assert response.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
+
+
+@pytest.mark.parametrize("call_enabled", [False, True])
+def test_new_call_assets_keep_lab_origin_gate_and_server_owned_capability(call_enabled):
+    from staff_call_https_lab import synthetic_app as call_app
+    from staff_https_lab import synthetic_app as readonly_app
+
+    port = 8444 if call_enabled else 8443
+    origin = f"https://staff.localhost:{port}"
+    factory = call_app if call_enabled else readonly_app
+    with factory(TOKEN, port) as wrapper:
+        with TestClient(wrapper, base_url=origin, client=("127.0.0.1", 50000)) as client:
+            database = wrapper.app.state.store.db_path
+            before = database.read_bytes()
+            for path in STAFF_ASSET_PATHS:
+                # Client hints cannot manufacture an environment capability.
+                response = client.get(path, headers={"X-Omachi-Preview-Actions": "call"})
+                assert response.status_code == 200
+                assert response.headers["x-omachi-preview"] == "synthetic"
+                assert response.headers.get("x-omachi-preview-actions") == ("call" if call_enabled else None)
+                assert response.headers["cache-control"] == "no-store"
+                assert "set-cookie" not in response.headers
+                assert TOKEN not in response.text
+                for host in ("https://localhost", "http://staff.localhost", "https://staff.localhost:9443"):
+                    rejected = client.get(host + path, follow_redirects=False)
+                    assert rejected.status_code == 403
+                    assert TOKEN not in rejected.text
+            response = client.post("/staff/session", headers={"Origin": origin, "X-Staff-Token": TOKEN})
+            assert response.status_code == 200
+            csrf = response.json()["csrf_token"]
+            listing = client.get("/staff/receptions")
+            assert listing.headers.get("x-omachi-preview-actions") == ("call" if call_enabled else None)
+            row = listing.json()["receptions"][0]
+            metadata = listing.json()["metadata"]
+            assert metadata["write_enabled"] is call_enabled
+            command = dict(operation_id=str(uuid4()), action="seat", expected_revision=row["revision"],
+                           write_epoch=metadata["write_epoch"])
+            headers = {"Origin": origin, "X-CSRF-Token": csrf, "X-Omachi-Preview-Actions": "call"}
+            # Reading the new JS never grants a broader write capability.
+            assert client.post(f'/staff/receptions/{row["id"]}/operations', json=command,
+                               headers=headers).status_code == 403
+            if not call_enabled:
+                assert client.post(f'/staff/receptions/{row["id"]}/operations',
+                                   json={**command, "action": "call"}, headers=headers).status_code == 403
+            assert database.read_bytes() == before
