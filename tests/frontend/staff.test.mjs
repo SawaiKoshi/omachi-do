@@ -844,6 +844,28 @@ test('background failure during explicit retry preflight prevents the retry POST
   assert.ok(h.storage.getItem(CALL_JOURNAL_KEY)); h.controller.stop();
 });
 
+for (const status of ['waiting', 'called']) {
+  test(`call+absent API lab stays read-only in the existing UI (${status})`, async () => {
+    const row = reception(1, { status, allowed_actions: status === 'waiting' ? ['call'] : ['absent'] });
+    const h = callHarness({ rows: [row], fetch: url => {
+      if (!url.startsWith('/staff/receptions?')) return undefined;
+      const view = new URL(url, 'https://staff.localhost').searchParams.get('view');
+      return { ...response(listing(view === 'active' ? [row] : [], view)), headers: { get: name => ({
+        'X-Omachi-Preview': 'synthetic', 'X-Omachi-Preview-Actions': 'call,absent',
+      })[name] ?? null } };
+    } });
+    await h.start();
+    assert.equal(h.el('staff-view').hidden, false);
+    await rowTrigger(rowItem(h)).emit('click');
+    assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
+    await h.controller.refresh();
+    assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+    assert.equal(h.storage.getItem('omachi.staff.call.guard.v1'), null);
+    assertReadOnlyRequests(h.requests);
+    h.controller.stop();
+  });
+}
+
 test('missing call capability on any page leaves the general UI read-only even with a writable metadata flag', async () => {
   const h = callHarness({ fetch: url => {
     if (!url.startsWith('/staff/receptions?')) return undefined;
