@@ -22,6 +22,8 @@ TOKEN = "synthetic-ui-shared-token-not-for-real-use-1234567890"
 STAFF_ASSET_PATHS = (
     "/staff/assets/staff.mjs", "/staff/assets/staff-call.mjs",
     "/staff/assets/staff-call-journal.mjs", "/staff/assets/staff.css",
+    "/staff/assets/staff-operation-ui.mjs", "/staff/assets/staff-operations.mjs",
+    "/staff/assets/staff-operation-contract.mjs", "/staff/assets/staff-operation-journal.mjs",
 )
 UI_PATHS = ("/staff/login", "/staff/", *STAFF_ASSET_PATHS)
 

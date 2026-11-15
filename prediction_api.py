@@ -434,6 +434,21 @@ def create_app(
         require_staff_page_origin(request)
         return FileResponse(web_directory / "staff" / "assets" / "staff-call-journal.mjs", media_type="text/javascript")
 
+    @app.get("/staff/assets/staff-operation-ui.mjs", include_in_schema=False)
+    @app.get("/staff/assets/staff-operations.mjs", include_in_schema=False)
+    @app.get("/staff/assets/staff-operation-contract.mjs", include_in_schema=False)
+    @app.get("/staff/assets/staff-operation-journal.mjs", include_in_schema=False)
+    def staff_operation_scripts(request: Request):
+        require_staff_page_origin(request)
+        # Only these exact routes are registered; never serve arbitrary paths.
+        names = {
+            "/staff/assets/staff-operation-ui.mjs": "staff-operation-ui.mjs",
+            "/staff/assets/staff-operations.mjs": "staff-operations.mjs",
+            "/staff/assets/staff-operation-contract.mjs": "staff-operation-contract.mjs",
+            "/staff/assets/staff-operation-journal.mjs": "staff-operation-journal.mjs",
+        }
+        return FileResponse(web_directory / "staff" / "assets" / names[request.url.path], media_type="text/javascript")
+
     @app.get("/staff/assets/staff.css", include_in_schema=False)
     def staff_stylesheet(request: Request):
         require_staff_page_origin(request)

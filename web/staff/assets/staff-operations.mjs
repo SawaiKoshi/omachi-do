@@ -1,4 +1,4 @@
-// Foundation only. Nothing imports or instantiates this from the browser UI.
+// Protected foundation, used only by the explicitly gated synthetic 8445 UI.
 import { createOperationJournal } from './staff-operation-journal.mjs';
 import { operationLabResponse, validOperationContext, validOperationReceipt,
   canApplyOperation, contractSignature, receiptMatchesCurrent } from './staff-operation-contract.mjs';

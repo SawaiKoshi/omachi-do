@@ -1,4 +1,4 @@
-"""Synthetic API/JS serialization contracts; this does not enable browser UI."""
+"""Synthetic API/JS serialization and 8445 UI asset/sequence contracts."""
 
 import json
 from contextlib import closing
@@ -94,3 +94,65 @@ def test_synthetic_api_receipts_match_common_action_contracts(action, status, ou
                                      cwd=PROJECT, input=payload, text=True, capture_output=True, timeout=15, check=False)
             assert checked.returncode == 0, checked.stderr
             assert checked.stdout == ''
+
+
+def test_8445_browser_modules_and_call_absent_call_preserve_intake_and_history():
+    with synthetic_app(TOKEN, 8445) as wrapper:
+        with TestClient(wrapper, base_url=ORIGIN, client=('127.0.0.1', 50000)) as client:
+            database = wrapper.app.state.store.db_path
+            assert database.parent.parent == Path('/tmp')
+            assert database.parent.name.startswith('omachi-migration-')
+            for name in ('staff-operation-ui', 'staff-operations', 'staff-operation-contract', 'staff-operation-journal'):
+                asset = client.get(f'/staff/assets/{name}.mjs')
+                assert asset.status_code == 200
+                assert asset.headers['x-omachi-preview-actions'] == 'call,absent'
+                assert asset.headers['cache-control'] == 'no-store'
+                assert TOKEN not in asset.text and 'set-cookie' not in asset.headers
+            session = client.post('/staff/session', headers={'Origin': ORIGIN, 'X-Staff-Token': TOKEN})
+            assert session.status_code == 200
+            headers = {'Origin': ORIGIN, 'X-CSRF-Token': session.json()['csrf_token']}
+            rows = client.get('/staff/receptions').json()['receptions']
+            original = next(r for r in rows if r['status'] == 'waiting')
+            path = f'/staff/receptions/{original["id"]}'
+            before = client.get(path + '/operation-context').json()
+
+            def persisted():
+                with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as conn:
+                    conn.execute('PRAGMA query_only=ON')
+                    conn.row_factory = sqlite3.Row
+                    row = dict(conn.execute('SELECT * FROM receptions WHERE id=?', (original['id'],)).fetchone())
+                    events = [tuple(r) for r in conn.execute('SELECT * FROM reception_events ORDER BY event_id')]
+                    quality = {name: [tuple(r) for r in conn.execute(f'SELECT * FROM {name}')]
+                               for (name,) in conn.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE '%quality%'")}
+                    return row, events, quality
+
+            first_row, first_events, first_quality = persisted()
+            saved = []
+            for action, status in [('call', 'called'), ('absent', 'absent'), ('call', 'called')]:
+                context = client.get(path + '/operation-context').json()
+                request = {'operation_id': str(uuid4()), 'action': action,
+                           'expected_revision': context['reception']['revision'], 'write_epoch': context['metadata']['write_epoch']}
+                result = client.post(path + '/operations', json=request, headers=headers)
+                assert result.status_code == 200 and result.json()['outcome'] == 'state_changed'
+                current = client.get(path + '/operation-context').json()
+                assert current['reception']['status'] == status
+                assert current['reception']['revision'] == context['reception']['revision'] + 1
+                assert current['metadata']['database_id'] == before['metadata']['database_id']
+                for field in ('id', 'display_number', 'received_at', 'reception_order', 'adults', 'children', 'total_people'):
+                    assert current['reception'][field] == original[field]
+                if action == 'absent':
+                    assert current['reception']['called_at'] == context['reception']['called_at']
+                row, events, quality = persisted()
+                for key, value in first_row.items():
+                    if key not in ('status', 'called_at', 'revision'):
+                        assert (row[key], type(row[key])) == (value, type(value)), key
+                assert events[:len(first_events)] == first_events
+                assert quality == first_quality
+                saved.append((request, result.json()))
+            latest = client.get(path + '/operation-context').json()
+            # Historical receipts cannot change the final call back to absent.
+            for request, receipt in saved:
+                assert client.post(path + '/operations', json=request, headers=headers).json() == receipt
+            assert client.get(path + '/operation-context').json() == latest
+            row, events, _ = persisted()
+            assert len(events) == len(first_events) + 3

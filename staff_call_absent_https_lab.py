@@ -201,7 +201,7 @@ def synthetic_app(token, port=PORT):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Synthetic call+absent API only; read-only browser UI, fixed port 8445.")
+    parser = argparse.ArgumentParser(description="Synthetic call+absent API and verified browser UI, fixed port 8445.")
     parser.add_argument("--cert", required=True, help="Development TLS certificate outside this repository")
     parser.add_argument("--key", required=True, help="Owner-only development private key outside this repository")
     parser.add_argument("--check", action="store_true", help="Validate and prepare disposable DB without starting a server")
@@ -224,7 +224,7 @@ def main(argv=None):
                 print("[check_ok] TLS, credential and disposable call+absent DB passed; no server started.", flush=True)
                 return 0
             print(f"Synthetic call+absent API only: https://staff.localhost:{PORT}/staff/login", flush=True)
-            print("Browser UI is read-only. Run only one staff.localhost lab at a time; resolve pending operations before switching ports (cookies share the host).", flush=True)
+            print("Synthetic browser UI: call+absent only, with confirmation and shared recovery. Run only one staff.localhost lab at a time; resolve pending operations before switching ports (cookies share the host).", flush=True)
             stage = "server_startup"
             uvicorn.run(
                 app, host="127.0.0.1", port=PORT, workers=1, reload=False,

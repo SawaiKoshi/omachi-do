@@ -1,5 +1,7 @@
-// Staff reads plus explicitly gated synthetic call lab. Secrets stay in memory.
+// Staff reads plus explicitly gated synthetic call / call+absent labs. Secrets stay in memory.
 import { callLabResponse, callLabMetadata, createStaffCall } from './staff-call.mjs';
+import { operationLabResponse, operationLabMetadata } from './staff-operation-contract.mjs';
+import { createStaffOperationUI } from './staff-operation-ui.mjs';
 const POLL_INTERVAL = 5_000;
 const REQUEST_TIMEOUT = 15_000;
 const PAGE_LIMIT = 100;
@@ -84,7 +86,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   let displayedVersion = null, displayedMetadata = null, detailTarget = null;
   let selectedTab = "active", menuEntry = null, gesture = null;
   let detailReturnTarget = null;
-  let callUI = null, callEnabled = false;
+  let callUI = null, callEnabled = false, operationEnabled = false, uiKind = null;
   let suppressClickUntil = 0;
   const pointers = new Set(), rowNodes = new Map(), scrollPositions = { active: 0, recently_seated: 0 };
   const controllers = new Map();
@@ -146,16 +148,17 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       ? [...new Set(entry.row.allowed_actions)].filter(action => typeof action === "string" && Object.hasOwn(ACTION_LABELS, action)) : [];
     get("row-menu-items").replaceChildren(...(actions.length ? actions.map(action => {
       const item = element("li");
-      if (action === "call" && callUI?.canStart(entry.row)) {
-        const button = element("button", "呼出を確認", "primary"); button.type = "button";
+      if ((action === "call" || operationEnabled && action === "absent") && callUI?.canStart(entry.row, action)) {
+        const button = element("button", `${ACTION_LABELS[action]}を確認`, "primary"); button.type = "button";
         button.addEventListener("click", () => { closeMenu(); void callUI.prepare(entry.row, () => {
           if (canBrowse() && rowNodes.get(entry.key) === entry) entry.trigger.focus();
-        }); });
+        }, action); });
         item.append(button);
       } else item.textContent = `${ACTION_LABELS[action]}（未接続・実行不可）`;
       return item;
     }) : [element("li", "この受付に利用可能な操作項目はありません。") ]));
-    text("row-menu-note", callEnabled ? "合成ラボ限定です。呼出は確認画面を経由します。他の操作は実行できません。"
+    text("row-menu-note", operationEnabled ? "合成ラボ限定です。呼出・不在は確認画面を経由します。他の操作は実行できません。"
+      : callEnabled ? "合成ラボ限定です。呼出は確認画面を経由します。他の操作は実行できません。"
       : "閲覧専用プレビューです。ここから操作は実行できません。");
     hidden("row-menu", false); get("row-menu").focus();
     return true;
@@ -205,7 +208,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   }
 
   function clearData() {
-    callEnabled = false;
+    callEnabled = false; operationEnabled = false;
     callUI?.suspend();
     closeMenu(); pointers.clear(); rowNodes.clear(); selectedTab = "active"; applyTabs();
     scrollPositions.active = 0; scrollPositions.recently_seated = 0;
@@ -232,6 +235,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   function lockData(value, { expired = false } = {}) {
     authVersion += 1;
     authenticated = false; csrf = "";
+    callUI?.expireAuthentication?.();
     abortReads(); clearData(); hidden("staff-view", true);
     disabled("logout-button", !logoutPending);
     disabled("refresh-button", expired || logoutPending);
@@ -241,6 +245,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
 
   async function request(path, { method = "GET", headers = {}, purpose = "refresh", proof } = {}) {
     if (!secureOrigin()) throw new ReadError("insecure");
+    const authentication = authVersion;
     const controller = new env.AbortController();
     controllers.set(controller, purpose);
     let timeout, abortHandler;
@@ -256,7 +261,11 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       }), interrupted]);
       hidden("synthetic-preview", response.headers?.get("X-Omachi-Preview") !== "synthetic");
       if (proof) proof.call = proof.call && callLabResponse(response);
-      if ([401, 403].includes(response.status)) throw new ReadError("auth", response.status);
+      if (proof) proof.operations = proof.operations && operationLabResponse(response);
+      if ([401, 403].includes(response.status)) {
+        if (authentication === authVersion) callUI?.expireAuthentication?.();
+        throw new ReadError("auth", response.status);
+      }
       if (response.status === 409) throw new ReadError("conflict");
       if (response.status === 429) throw new ReadError("rate");
       if (!response.ok) throw new ReadError("network");
@@ -387,7 +396,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     const background = canBrowse();
     abortReads({ preserveInteraction: background });
     const version = refreshVersion, authentication = authVersion;
-    const proof = { call: true };
+    const proof = { call: true, operations: env.location.port === "8445" };
     const current = () => started && !paused && !logoutPending && version === refreshVersion && authentication === authVersion;
     if (!background) {
       disabled("refresh-button", true);
@@ -427,20 +436,26 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       hidden("active-empty", active.rows.length > 0); hidden("recent-empty", recent.rows.length > 0);
       hidden("staff-view", false);
       get("staff-view").dataset.state = "current";
-      if (proof.call && callLabMetadata(active.metadata)) {
-        callEnabled = true;
-        callUI ??= createStaffCall({ document: doc, window: env, fetchImpl: fetcher, now,
+      const mode = proof.operations && operationLabMetadata(active.metadata) ? "operations"
+        : env.location.port !== "8445" && proof.call && callLabMetadata(active.metadata) ? "call" : null;
+      // A capability change within one origin never silently replaces a
+      // pending operation engine with another journal implementation.
+      if (mode && (uiKind === null || uiKind === mode)) {
+        uiKind = mode; operationEnabled = mode === "operations"; callEnabled = mode === "call";
+        callUI ??= (operationEnabled ? createStaffOperationUI : createStaffCall)({ document: doc, window: env, fetchImpl: fetcher, now,
           security: () => ({ active: started && authenticated && !paused && !needsLogin && !logoutPending,
-            ready: canBrowse(), version: authVersion, csrf }), refresh,
+            ready: canBrowse() && (mode === "operations" ? operationEnabled : callEnabled), version: authVersion, csrf }), refresh,
           authFailure: () => { lockData("認証を確認できません。未確定操作は保持しています。再ログインしてください。", { expired: true }); env.location.replace("/staff/login"); },
           validRow, validMetadata, rowSignature, metadataSignature });
         callUI.update({ metadata: active.metadata, rows: [...active.rows, ...recent.rows] });
-        text("staff-access-label", "共有認証・合成call限定");
-        text("staff-list-help", "番号で詳細を表示 · 右スワイプ／「⋯」から呼出を確認（合成データ限定）");
-        text("staff-footer", "開発用合成データ · 呼出のみ。案内・取消・訂正・品質審査・通知は実行できません。");
+        text("staff-access-label", operationEnabled ? "共有認証・合成call／absent限定" : "共有認証・合成call限定");
+        text("staff-list-help", operationEnabled ? "番号で詳細を表示 · 右スワイプ／「⋯」から呼出・不在を確認（合成データ限定）"
+          : "番号で詳細を表示 · 右スワイプ／「⋯」から呼出を確認（合成データ限定）");
+        text("staff-footer", operationEnabled ? "開発用合成データ · 呼出・不在のみ。復帰・案内・取消・訂正・品質審査・通知は実行できません。"
+          : "開発用合成データ · 呼出のみ。案内・取消・訂正・品質審査・通知は実行できません。");
       } else {
-        if (callEnabled) closeMenu();
-        callEnabled = false;
+        if (callEnabled || operationEnabled) closeMenu();
+        callEnabled = false; operationEnabled = false;
         callUI?.suspend();
         text("staff-access-label", "共有認証・閲覧のみ");
         text("staff-list-help", "番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー");
