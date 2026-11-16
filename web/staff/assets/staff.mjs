@@ -6,6 +6,12 @@ const POLL_INTERVAL = 5_000;
 const REQUEST_TIMEOUT = 15_000;
 const PAGE_LIMIT = 100;
 const MAX_PAGES = 100;
+// UI sheets are projections of two API sources, never separate queues.
+const SHEETS = [
+  { key: "active", prefix: "active", source: "active", statuses: ["waiting", "called"] },
+  { key: "absent", prefix: "absent", source: "active", statuses: ["absent"] },
+  { key: "recently_seated", prefix: "recent", source: "recently_seated", statuses: ["seated"] },
+];
 const ACTION_LABELS = { call: "呼出", absent: "不在", return: "復帰", seat: "案内完了", cancel: "受付取消", seating_correction: "誤案内訂正" };
 const LABELS = { waiting: "待機中", called: "呼出中", absent: "不在", seated: "案内済み", cancelled: "取消済み" };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -88,7 +94,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   let detailReturnTarget = null;
   let callUI = null, callEnabled = false, operationEnabled = false, uiKind = null;
   let suppressClickUntil = 0;
-  const pointers = new Set(), rowNodes = new Map(), scrollPositions = { active: 0, recently_seated: 0 };
+  const pointers = new Set(), rowNodes = new Map(), scrollPositions = Object.fromEntries(SHEETS.map(sheet => [sheet.key, 0]));
   const controllers = new Map();
   const text = (id, value) => { if (get(id) && get(id).textContent !== value) get(id).textContent = value; };
   const hidden = (id, value) => { if (get(id) && get(id).hidden !== value) get(id).hidden = value; };
@@ -119,21 +125,28 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   }
 
   function applyTabs() {
-    for (const [view, prefix] of [["active", "active"], ["recently_seated", "recent"]]) {
-      get(`${prefix}-tab`)?.setAttribute("aria-selected", String(selectedTab === view));
-      get(`${prefix}-tab`)?.setAttribute("tabindex", selectedTab === view ? "0" : "-1");
-      hidden(`${prefix}-panel`, selectedTab !== view);
+    for (const { key, prefix } of SHEETS) {
+      get(`${prefix}-tab`)?.setAttribute("aria-selected", String(selectedTab === key));
+      get(`${prefix}-tab`)?.setAttribute("tabindex", selectedTab === key ? "0" : "-1");
+      hidden(`${prefix}-panel`, selectedTab !== key);
     }
   }
 
   function selectTab(view, { focus = false } = {}) {
-    if (!canBrowse() || !["active", "recently_seated"].includes(view)) return false;
+    const sheet = SHEETS.find(item => item.key === view);
+    if (!canBrowse() || !sheet) return false;
+    // An unsubmitted confirmation must be explicitly cancelled first. A sent
+    // or uncertain operation lives outside the sheets and survives navigation.
+    if (callUI?.isConfirming()) {
+      if (!get("call-confirmation").hidden) get("call-dismiss")?.focus();
+      return false;
+    }
     closeMenu(); closeDetail();
     const scroll = get("reception-scroll");
     if (scroll) scrollPositions[selectedTab] = scroll.scrollTop;
     selectedTab = view; applyTabs();
     if (scroll) scroll.scrollTop = scrollPositions[view];
-    if (focus) get(view === "active" ? "active-tab" : "recent-tab")?.focus();
+    if (focus) get(`${sheet.prefix}-tab`)?.focus();
     return true;
   }
 
@@ -211,13 +224,15 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     callEnabled = false; operationEnabled = false;
     callUI?.suspend();
     closeMenu(); pointers.clear(); rowNodes.clear(); selectedTab = "active"; applyTabs();
-    scrollPositions.active = 0; scrollPositions.recently_seated = 0;
     if (get("reception-scroll")) get("reception-scroll").scrollTop = 0;
-    disabled("active-tab", true); disabled("recent-tab", true);
     displayedVersion = null; displayedMetadata = null;
-    for (const id of ["active-list", "recent-list"]) get(id)?.replaceChildren();
+    for (const { key, prefix } of SHEETS) {
+      scrollPositions[key] = 0;
+      disabled(`${prefix}-tab`, true); text(`${prefix}-tab-count`, "—");
+      get(`${prefix}-list`)?.replaceChildren(); hidden(`${prefix}-empty`, true);
+    }
     for (const id of ["waiting-count", "called-count", "absent-count"]) text(id, "—");
-    for (const id of ["active-empty", "recent-empty"]) hidden(id, true);
+    text("unseated-count", "—");
     text("updated-at", "最新情報は取得できていません");
     closeDetail();
   }
@@ -344,9 +359,9 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     return result;
   }
 
-  function renderRows(id, rows) {
-    const view = id === "active-list" ? "active" : "recently_seated";
-    const list = get(id), retained = new Set(rows.map(row => `${view}:${row.id}`));
+  function renderRows(sheet, rows) {
+    const view = sheet.key;
+    const list = get(`${sheet.prefix}-list`), retained = new Set(rows.map(row => `${view}:${row.id}`));
     for (const [key, entry] of rowNodes) {
       if (entry.view === view && !retained.has(key)) {
         list.removeChild(entry.item); rowNodes.delete(key);
@@ -368,7 +383,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       button.setAttribute("aria-label", `${numberText(row.display_number)}の詳細を確認`);
       button.addEventListener("click", () => { void openDetail(row.id); });
       const time = element("span", undefined, "row-time");
-      if (view === "recently_seated") time.append(element("span", `案内 ${timeText(row.valid_seating_event.occurred_at)}`));
+      if (sheet.source === "recently_seated") time.append(element("span", `案内 ${timeText(row.valid_seating_event.occurred_at)}`));
       time.append(element("span", `受付 ${timeText(row.received_at)}`));
       const trigger = element("button", "⋯", "menu-toggle");
       trigger.type = "button";
@@ -400,7 +415,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     const current = () => started && !paused && !logoutPending && version === refreshVersion && authentication === authVersion;
     if (!background) {
       disabled("refresh-button", true);
-      disabled("active-tab", true); disabled("recent-tab", true);
+      for (const { prefix } of SHEETS) disabled(`${prefix}-tab`, true);
       if (get("staff-view")) get("staff-view").dataset.state = "loading";
       message("セッションと最新情報を確認しています…");
     }
@@ -418,22 +433,34 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       if (recent.rows.some(row => activeIds.has(row.id))) throw new ReadError("invalid");
       const configurationChanged = displayedMetadata !== null
         && metadataSignature(displayedMetadata) !== metadataSignature(active.metadata);
-      const nextRows = new Map([...active.rows.map(row => [`active:${row.id}`, row]),
-        ...recent.rows.map(row => [`recently_seated:${row.id}`, row])]);
+      const sources = { active: active.rows, recently_seated: recent.rows };
+      const sheets = SHEETS.map(sheet => ({ sheet, rows: sources[sheet.source].filter(row => sheet.statuses.includes(row.status)) }));
+      const nextRows = new Map(sheets.flatMap(({ sheet, rows }) => rows.map(row => [`${sheet.key}:${row.id}`, row])));
       const unchanged = entry => entry && !configurationChanged
         && nextRows.has(entry.key) && rowSignature(nextRows.get(entry.key)) === entry.signature;
+      const focusedRow = [...rowNodes.values()].find(entry => entry.item.contains(doc.activeElement));
+      const restoreRowFocus = focusedRow && !unchanged(focusedRow)
+        ? { key: focusedRow.key, part: focusedRow.trigger.contains(doc.activeElement) ? "trigger" : "button" } : null;
       if ((menuEntry && !unchanged(menuEntry)) || (gesture && !unchanged(gesture.entry))) closeMenu();
       if (detailTarget && !unchanged(detailTarget)) closeDetail();
       const scroll = get("reception-scroll"), top = scroll?.scrollTop, left = scroll?.scrollLeft;
-      renderRows("active-list", active.rows);
-      renderRows("recent-list", recent.rows);
+      for (const { sheet, rows } of sheets) {
+        renderRows(sheet, rows);
+        text(`${sheet.prefix}-tab-count`, String(rows.length)); hidden(`${sheet.prefix}-empty`, rows.length > 0);
+      }
+      if (restoreRowFocus) {
+        const target = rowNodes.get(restoreRowFocus.key)?.[restoreRowFocus.part]
+          ?? get(`${SHEETS.find(sheet => sheet.key === selectedTab).prefix}-tab`);
+        target?.focus();
+      }
       // Restore the position at COMMIT time, not the position at request start:
       // staff may have scrolled while the network request was in progress.
       if (scroll && scroll.scrollTop !== top) scroll.scrollTop = top;
       if (scroll && scroll.scrollLeft !== left) scroll.scrollLeft = left;
+      if (scroll) scrollPositions[selectedTab] = scroll.scrollTop;
       displayedMetadata = active.metadata; displayedVersion = active.version;
       for (const status of ["waiting", "called", "absent"]) text(`${status}-count`, String(active.rows.filter(row => row.status === status).length));
-      hidden("active-empty", active.rows.length > 0); hidden("recent-empty", recent.rows.length > 0);
+      text("unseated-count", String(active.rows.length));
       hidden("staff-view", false);
       get("staff-view").dataset.state = "current";
       const mode = proof.operations && operationLabMetadata(active.metadata) ? "operations"
@@ -461,7 +488,8 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
         text("staff-list-help", "番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー");
         text("staff-footer", "閲覧専用 · 状態変更・訂正・通知は未接続です。");
       }
-      disabled("active-tab", false); disabled("recent-tab", false); applyTabs();
+      for (const { prefix } of SHEETS) disabled(`${prefix}-tab`, false);
+      applyTabs();
       text("updated-at", `${new Date(now()).toLocaleTimeString("ja-JP", { timeZone: "Asia/Tokyo" })} に全件取得 · 5秒ごとに更新`);
       message("");
       return true;
@@ -637,13 +665,14 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   function submit(event) { void login(event); }
   function refreshClick() { void refresh(); }
   function logoutClick() { void logout(); }
-  function activeTabClick() { selectTab("active"); }
-  function recentTabClick() { selectTab("recently_seated"); }
+  const tabHandlers = SHEETS.map(sheet => ({ sheet, click: () => { selectTab(sheet.key); } }));
   function tabKey(event) {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) || !canBrowse()) return;
     event.preventDefault();
-    selectTab(event.key === "Home" ? "active" : event.key === "End" ? "recently_seated"
-      : selectedTab === "active" ? "recently_seated" : "active", { focus: true });
+    const index = SHEETS.findIndex(sheet => sheet.key === selectedTab);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? SHEETS.length - 1
+      : (index + (event.key === "ArrowRight" ? 1 : -1) + SHEETS.length) % SHEETS.length;
+    selectTab(SHEETS[next].key, { focus: true });
   }
   function menuCloseClick() { closeMenu({ restoreFocus: true }); }
   function detailCloseClick() { closeDetail({ restoreFocus: true }); }
@@ -678,9 +707,10 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   get("refresh-button")?.addEventListener("click", refreshClick);
   get("logout-button")?.addEventListener("click", logoutClick);
   get("detail-close")?.addEventListener("click", detailCloseClick);
-  get("active-tab")?.addEventListener("click", activeTabClick);
-  get("recent-tab")?.addEventListener("click", recentTabClick);
-  for (const id of ["active-tab", "recent-tab"]) get(id)?.addEventListener("keydown", tabKey);
+  for (const { sheet, click } of tabHandlers) {
+    get(`${sheet.prefix}-tab`)?.addEventListener("click", click);
+    get(`${sheet.prefix}-tab`)?.addEventListener("keydown", tabKey);
+  }
   get("row-menu-close")?.addEventListener("click", menuCloseClick);
   get("reception-scroll")?.addEventListener("scroll", listScroll, { passive: true });
   doc.addEventListener("keydown", keyDown);
@@ -699,9 +729,10 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     get("refresh-button")?.removeEventListener("click", refreshClick);
     get("logout-button")?.removeEventListener("click", logoutClick);
     get("detail-close")?.removeEventListener("click", detailCloseClick);
-    get("active-tab")?.removeEventListener("click", activeTabClick);
-    get("recent-tab")?.removeEventListener("click", recentTabClick);
-    for (const id of ["active-tab", "recent-tab"]) get(id)?.removeEventListener("keydown", tabKey);
+    for (const { sheet, click } of tabHandlers) {
+      get(`${sheet.prefix}-tab`)?.removeEventListener("click", click);
+      get(`${sheet.prefix}-tab`)?.removeEventListener("keydown", tabKey);
+    }
     get("row-menu-close")?.removeEventListener("click", menuCloseClick);
     get("reception-scroll")?.removeEventListener("scroll", listScroll);
     doc.removeEventListener("keydown", keyDown);

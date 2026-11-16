@@ -210,6 +210,7 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
   for (const [type, handler] of Object.entries(successHandlers)) get('call-success-view')?.addEventListener(type, handler);
   doc.addEventListener('keydown', keyDown);
   return { canStart, prepare, update, suspend, clearSuccess,
+    isConfirming: () => preparing || ticket !== null,
     expireAuthentication() { engine.expireAuthentication(); closeDisplay(); },
     stop() {
       alive = false; engine.stop(); closeDisplay();

@@ -374,6 +374,7 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
   } catch { lockState = 'unavailable'; }
 
   return { prepare, confirm, lookup, retry, canStart, update, suspend, clearSuccess,
+    isConfirming: () => preparing || confirmation !== null,
     stop() {
       alive = false; invalidate(); releaseLock?.();
       for (const [id, handler] of Object.entries(handlers)) get(id)?.removeEventListener('click', handler);
