@@ -231,7 +231,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       disabled(`${prefix}-tab`, true); text(`${prefix}-tab-count`, "—");
       get(`${prefix}-list`)?.replaceChildren(); hidden(`${prefix}-empty`, true);
     }
-    for (const id of ["waiting-count", "called-count", "absent-count"]) text(id, "—");
+    for (const id of ["waiting-count", "called-count"]) text(id, "—");
     text("unseated-count", "—");
     text("updated-at", "最新情報は取得できていません");
     closeDetail();
@@ -459,7 +459,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
       if (scroll && scroll.scrollLeft !== left) scroll.scrollLeft = left;
       if (scroll) scrollPositions[selectedTab] = scroll.scrollTop;
       displayedMetadata = active.metadata; displayedVersion = active.version;
-      for (const status of ["waiting", "called", "absent"]) text(`${status}-count`, String(active.rows.filter(row => row.status === status).length));
+      for (const status of ["waiting", "called"]) text(`${status}-count`, String(active.rows.filter(row => row.status === status).length));
       text("unseated-count", String(active.rows.length));
       hidden("staff-view", false);
       get("staff-view").dataset.state = "current";

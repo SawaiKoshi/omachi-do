@@ -25,15 +25,21 @@
       </div>
     </div>
     <div id="staff-view" hidden>
-      <section class="summary-grid" aria-label="未案内受付の内訳">
-        <div class="summary waiting"><p>待機中</p><strong id="waiting-count">—</strong><span>組</span></div>
-        <div class="summary called"><p>呼出中</p><strong id="called-count">—</strong><span>組</span></div>
-        <div class="summary absent"><p>不在</p><strong id="absent-count">—</strong><span>組</span></div>
-      </section>
-      <div class="list-tabs" role="tablist" aria-label="受付一覧の切替">
-        <button id="active-tab" type="button" role="tab" aria-selected="true" aria-controls="active-panel" tabindex="0" disabled>受付中 <span id="active-tab-count" class="tab-count">—</span>組</button>
-        <button id="absent-tab" type="button" role="tab" aria-selected="false" aria-controls="absent-panel" tabindex="-1" disabled>不在 <span id="absent-tab-count" class="tab-count">—</span>組</button>
-        <button id="recent-tab" type="button" role="tab" aria-selected="false" aria-controls="recent-panel" tabindex="-1" disabled>案内済み <span id="recent-tab-count" class="tab-count">—</span>組</button>
+      <div class="summary-grid" role="tablist" aria-label="受付一覧の切替">
+        <button id="active-tab" class="summary" type="button" role="tab" aria-selected="true" aria-controls="active-panel" tabindex="0" disabled>
+          <span class="summary-title">受付中</span>
+          <span class="summary-metric"><strong id="active-tab-count" class="tab-count">—</strong><span>組</span></span>
+          <span class="summary-note"><span>待機<span id="waiting-count">—</span>組</span><span>・呼出<span id="called-count">—</span>組</span></span>
+        </button>
+        <button id="absent-tab" class="summary" type="button" role="tab" aria-selected="false" aria-controls="absent-panel" tabindex="-1" disabled>
+          <span class="summary-title">不在</span>
+          <span class="summary-metric"><strong id="absent-tab-count" class="tab-count">—</strong><span>組</span></span>
+        </button>
+        <button id="recent-tab" class="summary" type="button" role="tab" aria-selected="false" aria-controls="recent-panel" tabindex="-1" disabled>
+          <span class="summary-title">案内済み</span>
+          <span class="summary-metric"><strong id="recent-tab-count" class="tab-count">—</strong><span>組</span></span>
+          <span class="summary-note">直近24時間</span>
+        </button>
       </div>
       <p class="list-help"><span id="staff-list-help">番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー</span><span>未案内合計 <strong id="unseated-count">—</strong>組（不在を含む）</span></p>
       <div id="reception-scroll" class="reception-scroll" tabindex="0" role="region" aria-label="受付一覧のスクロール領域">

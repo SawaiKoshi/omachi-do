@@ -13,7 +13,7 @@ import { createOperationJournal, OPERATION_JOURNAL_KEY, OPERATION_RECOVERY_MS } 
 const IDS = [
   'login-view', 'login-form', 'staff-token', 'login-button', 'login-message',
   'staff-view', 'logout-button', 'refresh-button', 'status-message', 'updated-at',
-  'waiting-count', 'called-count', 'absent-count', 'active-list', 'recent-list',
+  'waiting-count', 'called-count', 'active-list', 'recent-list',
   'absent-list', 'absent-empty', 'absent-tab', 'absent-panel',
   'active-tab-count', 'absent-tab-count', 'recent-tab-count', 'unseated-count',
   'detail-view', 'detail-title', 'detail-content', 'detail-close',
@@ -808,7 +808,7 @@ test('the current row comes from context/list reads, even when a historical rece
   } });
   await h.start(); await h.openCall(); await h.confirmCall();
   await h.el('call-lookup').emit('click'); await settle(); await settle();
-  assert.equal(h.el('absent-count').textContent, '1');
+  assert.equal(h.el('absent-tab-count').textContent, '1');
   assert.equal(h.el('called-count').textContent, '0');
   assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null); h.controller.stop();
 });
@@ -919,7 +919,7 @@ test('an existing cookie session restores the management screen with exact count
   assert.equal(h.el('staff-view').hidden, false);
   assert.equal(h.el('waiting-count').textContent, '1');
   assert.equal(h.el('called-count').textContent, '1');
-  assert.equal(h.el('absent-count').textContent, '1');
+  assert.equal(h.el('absent-tab-count').textContent, '1');
   const text = h.el('active-list').textContent;
   assert.ok(text.indexOf('001') < text.indexOf('002'));
   assert.doesNotMatch(text, /003|不在/);
@@ -1039,7 +1039,7 @@ test('compact rows preserve order and show main ticket, full date and all five c
   }
   assert.equal(h.el('waiting-count').textContent, '1');
   assert.equal(h.el('called-count').textContent, '1');
-  assert.equal(h.el('absent-count').textContent, '1');
+  assert.equal(h.el('absent-tab-count').textContent, '1');
   h.controller.stop();
 });
 
@@ -1246,7 +1246,7 @@ test('twenty-five identical polling cycles preserve every row, counts, focus, me
   const h = harness({ rows: [reception(1), reception(2)], recent: [seatedRow(3)] });
   await h.start();
   const active = [...h.el('active-list').children], recent = [...h.el('recent-list').children];
-  const counts = ['waiting-count', 'called-count', 'absent-count'].map(id => h.el(id).textContent);
+  const counts = ['waiting-count', 'called-count', 'absent-tab-count'].map(id => h.el(id).textContent);
   await rowTrigger(active[0]).emit('click');
   const focus = h.doc.activeElement, menuItems = [...h.el('row-menu-items').children];
   h.el('reception-scroll').scrollTop = 230;
@@ -1259,7 +1259,7 @@ test('twenty-five identical polling cycles preserve every row, counts, focus, me
     assert.deepEqual(h.el('active-list').children, active);
     assert.deepEqual(h.el('recent-list').children, recent);
     assert.deepEqual(h.el('row-menu-items').children, menuItems);
-    assert.deepEqual(['waiting-count', 'called-count', 'absent-count'].map(id => h.el(id).textContent), counts);
+    assert.deepEqual(['waiting-count', 'called-count', 'absent-tab-count'].map(id => h.el(id).textContent), counts);
     assert.equal(h.el('staff-view').dataset.state, 'current');
     assert.equal(h.el('status-message').hidden, true);
     assert.equal(h.el('row-menu').hidden, false);
@@ -1609,6 +1609,74 @@ test('actual HTML connects tabs to unique panels and keeps preview items outside
   assert.doesNotMatch(html, /onclick=|onpointer|<button[^>]*(?:seat|cancel|correction|line-send)/i);
 });
 
+test('the only three tab buttons are the upper summary frames with valid content and no duplicate absent counter', () => {
+  const html = readFileSync(new URL('../../web/staff/index.html', import.meta.url), 'utf8');
+  const top = html.match(/<div class="summary-grid"[^>]*role="tablist"[^>]*>([^]*?)<\/div>/);
+  assert.ok(top, 'The summary grid itself must be the tablist');
+  assert.equal([...html.matchAll(/role="tablist"/g)].length, 1);
+  assert.equal([...html.matchAll(/role="tab"/g)].length, 3);
+  const buttons = [...top[1].matchAll(/<button\b([^>]*)>([^]*?)<\/button>/g)];
+  assert.equal(buttons.length, 3);
+  for (const [index, prefix] of ['active', 'absent', 'recent'].entries()) {
+    assert.match(buttons[index][1], new RegExp(`id="${prefix}-tab"`));
+    assert.match(buttons[index][1], /type="button"[^>]*role="tab"/);
+    assert.match(buttons[index][2], new RegExp(`id="${prefix}-tab-count"`));
+    assert.doesNotMatch(buttons[index][2], /<(?:button|input|a|div|p)\b/, 'No nested control or invalid block content');
+  }
+  assert.match(buttons[0][2], /受付中[^]*?待機<span id="waiting-count">[^]*?呼出<span id="called-count">/);
+  assert.match(buttons[1][2], /不在/); assert.match(buttons[2][2], /案内済み[^]*?直近24時間/);
+  assert.ok(top.index < html.indexOf('id="reception-scroll"'));
+  assert.match(html, /未案内合計[^]*?id="unseated-count"[^]*?不在を含む/);
+  assert.doesNotMatch(html, /class="list-tabs"|id="absent-count"/);
+  const css = readFileSync(new URL('../../web/staff/assets/staff.css', import.meta.url), 'utf8');
+  assert.match(css, /\.summary-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/);
+  assert.match(css, /\.summary\[aria-selected="true"\]/);
+  assert.match(css, /\.tab-count\s*\{[^}]*font-variant-numeric:\s*tabular-nums/);
+  assert.doesNotMatch(css, /\.list-tabs|\.summary\.(?:called|absent)|\.summary p/);
+});
+
+for (const mode of ['readonly', 'call', 'operations']) {
+  test(`${mode} summary tabs reuse sheet navigation and show active breakdown separately from all unseated groups`, async () => {
+    const storage = new CallStorage();
+    const rows = [reception(1), reception(2, { status: 'called' }), reception(3, { status: 'absent' })];
+    const h = harness({ rows, recent: [seatedRow(5), seatedRow(4)], storage,
+      callLab: mode === 'call', operationLab: mode === 'operations' }); await h.start();
+    assert.equal(h.el('active-tab-count').textContent, '2');
+    assert.equal(h.el('waiting-count').textContent, '1'); assert.equal(h.el('called-count').textContent, '1');
+    assert.equal(h.el('absent-tab-count').textContent, '1'); assert.equal(h.el('recent-tab-count').textContent, '2');
+    assert.equal(h.el('unseated-count').textContent, '3');
+    const journal = [...storage.values.entries()], requestCount = h.requests.length;
+    for (const prefix of ['absent', 'recent', 'active']) {
+      // Keyboard-generated button activation has detail=0; actual Enter/Space
+      // default activation is provided by the native HTML button, not new JS.
+      await h.el(`${prefix}-tab`).emit('click', { detail: 0 });
+      assert.equal(h.el(`${prefix}-panel`).hidden, false);
+      assert.equal(h.el(`${prefix}-tab`).getAttribute('aria-selected'), 'true');
+      assert.equal(h.el(`${prefix}-tab`).getAttribute('tabindex'), '0');
+    }
+    assert.equal(h.requests.length, requestCount); assert.deepEqual([...storage.values.entries()], journal);
+    assertReadOnlyRequests(h.requests); h.controller.stop();
+  });
+}
+
+test('focused summary frames and the selected sheet survive polling and digit changes without rebuilding list rows', async () => {
+  const rows = [reception(1), reception(2, { status: 'absent' })];
+  const h = harness({ rows }); await h.start(); await h.el('absent-tab').emit('click');
+  const absent = rowItem(h, 0, 'absent'), frame = h.el('absent-tab'); frame.focus();
+  h.el('reception-scroll').scrollTop = 180;
+  for (let i = 3; i <= 12; i++) rows.push(reception(i));
+  await h.tick(5001);
+  assert.equal(h.el('active-tab-count').textContent, '11'); assert.equal(h.el('waiting-count').textContent, '11');
+  assert.equal(h.el('unseated-count').textContent, '12'); assert.equal(h.el('absent-tab-count').textContent, '1');
+  for (let i = 0; i < 20; i++) {
+    await h.tick(5001);
+    assert.equal(h.doc.activeElement, frame); assert.equal(h.el('absent-tab'), frame);
+    assert.equal(frame.getAttribute('aria-selected'), 'true'); assert.equal(rowItem(h, 0, 'absent'), absent);
+    assert.equal(h.el('reception-scroll').scrollTop, 180);
+  }
+  assertReadOnlyRequests(h.requests); h.controller.stop();
+});
+
 test('login communication loss has no automatic credential resubmission', async () => {
   const h = harness({ page: 'login', fetch: async (_url, options) => {
     if (options.method === 'POST') throw new TypeError('network outage');
@@ -1902,7 +1970,7 @@ test('every active page contributes to counts, with no false fifty-row total', a
   await h.start();
   assert.equal(h.el('waiting-count').textContent, '110');
   assert.equal(h.el('called-count').textContent, '30');
-  assert.equal(h.el('absent-count').textContent, '11');
+  assert.equal(h.el('absent-tab-count').textContent, '11');
   assert.match(h.el('absent-list').textContent, /151/);
   assert.equal(h.el('unseated-count').textContent, '151');
   assertReadOnlyRequests(h.requests);
@@ -2706,7 +2774,7 @@ test('three sheets classify every row once, preserve each source order and disti
   assert.equal(new Set(all).size, 7);
   assert.deepEqual(['active', 'absent', 'recent'].map(prefix => h.el(`${prefix}-tab-count`).textContent), ['3', '2', '2']);
   assert.equal(h.el('unseated-count').textContent, '5');
-  assert.deepEqual(['waiting', 'called', 'absent'].map(status => h.el(`${status}-count`).textContent), ['2', '1', '2']);
+  assert.deepEqual(['waiting-count', 'called-count', 'absent-tab-count'].map(id => h.el(id).textContent), ['2', '1', '2']);
   assert.equal(JSON.stringify({ rows, recent }), before, 'display classification cannot mutate saved source data');
   assert.deepEqual(h.requests.filter(r => r.url.startsWith('/staff/receptions?')).map(r => {
     const params = new URL(r.url, h.env.location.origin).searchParams;
