@@ -201,7 +201,7 @@ class ReceptionStore:
             conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             # Check before any business DML, within the same transaction/lock.
             validate_schema(conn, self.schema_version, check_integrity=False,
-                            allow_revision_required=True)
+                            allow_revision_required=True, allow_v1_stat1=True)
             if self.schema_version == 2:
                 identity = tuple(conn.execute("SELECT database_id,write_epoch FROM store_metadata").fetchone())
                 if identity != self._database_identity:
@@ -246,7 +246,7 @@ class ReceptionStore:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 version = SCHEMA_VERSION
             expected = self.schema_version if self.schema_version is not None else version
-            validate_schema(conn, expected, allow_revision_required=True)
+            validate_schema(conn, expected, allow_revision_required=True, allow_v1_stat1=True)
             validate_history(conn, expected)
             identity = tuple(conn.execute("SELECT database_id,write_epoch FROM store_metadata").fetchone()) if expected == 2 else None
             if self._database_identity is not None and identity != self._database_identity:

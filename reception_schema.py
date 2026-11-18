@@ -39,10 +39,17 @@ def integrity(conn):
         raise SchemaValidationError("Foreign-key violations; data is not repaired automatically.")
 
 
-def validate_schema(conn, version, *, check_integrity=True, allow_revision_required=False):
+def validate_schema(conn, version, *, check_integrity=True, allow_revision_required=False,
+                    allow_v1_stat1=False):
     if type(version) is not int or version not in (1, 2) or conn.execute("PRAGMA user_version").fetchone()[0] != version:
         raise SchemaValidationError(f"Expected schema v{version}; no automatic migration.")
-    if signature(conn) != expected_signature(version):
+    actual = signature(conn)
+    if version == 1 and allow_v1_stat1:
+        # Only the runtime store accepts SQLite's optional ANALYZE table.
+        stat1 = ("table", "sqlite_stat1", "sqlite_stat1", "CREATE TABLE sqlite_stat1(tbl,idx,stat)")
+        if actual.count(stat1) == 1:
+            actual = tuple(entry for entry in actual if entry != stat1)
+    if actual != expected_signature(version):
         raise SchemaValidationError("Incomplete or unexpected schema, constraints, indexes, or triggers.")
     if check_integrity:
         integrity(conn)

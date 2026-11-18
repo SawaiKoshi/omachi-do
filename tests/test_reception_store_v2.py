@@ -19,7 +19,7 @@ from reception_migration.migration import copy_database, migrate
 from reception_migration.safety import temporary_workspace
 from reception_migration.schema import TRIGGERS
 from reception_migration.synthetic import BASE, create_v1
-from reception_schema import STATE_FIELDS, validate_history, validate_schema
+from reception_schema import SchemaValidationError, STATE_FIELDS, validate_history, validate_schema
 from reception_store import ReceptionStore, StateConflict, StoreValidationError
 from staff_operation import canonical_json, command_request, receipt_response
 
@@ -50,6 +50,54 @@ def frozen_v1_store():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("case", ["standard", "analyzed", "extra_index", "missing_index",
+                                  "history", "modified_stat1"])
+def test_v1_runtime_statistics_compatibility(case):
+    with temporary_workspace() as lab:
+        database, _ = create_v1(lab)
+        with lab.connection(database) as conn:
+            if case != "standard":
+                conn.execute("ANALYZE")
+            if case == "extra_index":
+                conn.execute("CREATE INDEX extra_index ON receptions(received_at)")
+            elif case == "missing_index":
+                conn.execute("DROP INDEX queue_status_order")
+            elif case == "history":
+                conn.execute("UPDATE receptions SET actual_wait_minutes=99 WHERE status='seated'")
+            elif case == "modified_stat1":
+                # Alter the catalog of this disposable fixture, then reopen it.
+                conn.execute("PRAGMA writable_schema=ON")
+                conn.execute("UPDATE sqlite_schema SET sql='CREATE TABLE sqlite_stat1(tbl,idx,stat TEXT)' "
+                             "WHERE name='sqlite_stat1'")
+            if case == "analyzed":
+                with pytest.raises(SchemaValidationError):
+                    validate_schema(conn, 1)  # Migration preflight stays strict.
+        before = sha256(database.read_bytes()).digest()
+        if case in ("standard", "analyzed"):
+            assert ReceptionStore(database).get_queue()
+        else:
+            with pytest.raises(StoreValidationError):
+                ReceptionStore(database)
+        assert sha256(database.read_bytes()).digest() == before
+
+
+@pytest.mark.parametrize("mode", ["legacy", "revision_required"])
+def test_v2_does_not_inherit_v1_statistics_exception(pair, mode):
+    lab, paths = pair
+    database = paths[2]
+    with lab.connection(database) as conn:
+        conn.execute("UPDATE store_metadata SET staff_write_mode=?", (mode,))
+    before = sha256(database.read_bytes()).digest()
+    assert ReceptionStore(database).get_queue() == []
+    assert sha256(database.read_bytes()).digest() == before
+    with lab.connection(database) as conn:
+        conn.execute("ANALYZE")
+    before = sha256(database.read_bytes()).digest()
+    with pytest.raises(StoreValidationError):
+        ReceptionStore(database)
+    assert sha256(database.read_bytes()).digest() == before
 
 
 def prediction(**kwargs):
