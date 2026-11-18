@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>受付状況 | おまちどう スタッフ</title>
+  <link rel="stylesheet" href="/staff/assets/staff.css">
+  <script type="module" src="/staff/assets/staff.mjs"></script>
+</head>
+<body data-staff-page="receptions">
+  <header class="app-header">
+    <a class="brand" href="/staff/"><span class="brand-mark" aria-hidden="true">お</span>おまちどう<span class="brand-caption">スタッフ専用</span></a>
+    <button id="logout-button" type="button" class="secondary" disabled>ログアウト</button>
+  </header>
+  <main class="staff-main">
+    <p id="synthetic-preview" class="synthetic-preview" hidden>開発専用・合成データのみ</p>
+    <div class="page-heading"><h1>受付状況 <span id="staff-access-label" class="readonly">共有認証・閲覧のみ</span></h1><button id="refresh-button" class="secondary" type="button" disabled>最新情報を取得</button></div>
+    <div id="update-status" class="update-status">
+      <p id="status-message" class="message" role="status" aria-live="polite">セッションを確認しています…</p>
+      <p id="updated-at" class="updated" hidden>まだ更新されていません</p>
+      <div id="call-success-view" class="call-success" role="status" aria-live="polite" aria-atomic="true" hidden>
+        <span id="call-success-message"></span>
+        <button id="call-success-close" type="button" class="secondary" aria-label="成功通知を閉じる">閉じる</button>
+      </div>
+    </div>
+    <div id="staff-view" hidden>
+      <div class="summary-grid" role="tablist" aria-label="受付一覧の切替">
+        <button id="active-tab" class="summary" type="button" role="tab" aria-selected="true" aria-controls="active-panel" tabindex="0" disabled>
+          <span class="summary-title">受付中</span>
+          <span class="summary-metric"><strong id="active-tab-count" class="tab-count">—</strong><span>組</span></span>
+          <span class="summary-note"><span>待機<span id="waiting-count">—</span>組</span><span>・呼出<span id="called-count">—</span>組</span></span>
+        </button>
+        <button id="absent-tab" class="summary" type="button" role="tab" aria-selected="false" aria-controls="absent-panel" tabindex="-1" disabled>
+          <span class="summary-title">不在</span>
+          <span class="summary-metric"><strong id="absent-tab-count" class="tab-count">—</strong><span>組</span></span>
+        </button>
+        <button id="recent-tab" class="summary" type="button" role="tab" aria-selected="false" aria-controls="recent-panel" tabindex="-1" disabled>
+          <span class="summary-title">案内済み</span>
+          <span class="summary-metric"><strong id="recent-tab-count" class="tab-count">—</strong><span>組</span></span>
+          <span class="summary-note">直近24時間</span>
+        </button>
+      </div>
+      <p class="list-help"><span id="staff-list-help">番号で詳細を表示 · 右スワイプ／「⋯」で閲覧専用メニュー</span><span>未案内合計 <strong id="unseated-count">—</strong>組（不在を含む）</span></p>
+      <div id="reception-scroll" class="reception-scroll" tabindex="0" role="region" aria-label="受付一覧のスクロール領域">
+      <section id="active-panel" class="reception-panel" role="tabpanel" aria-labelledby="active-tab">
+        <h2 id="active-title" class="list-caption">受付中のお客様 <span class="order-note">待機中・呼出中／元の受付順</span></h2>
+        <div class="list-columns" aria-hidden="true"><span>受付番号・受付日</span><span>受付時刻</span><span>人数</span><span>現在状態</span><span>メニュー</span></div>
+        <ol id="active-list" class="reception-list" aria-label="受付順の待機中・呼出中一覧"></ol>
+        <p id="active-empty" class="empty-state" hidden>待機中・呼出中の受付はありません。</p>
+      </section>
+      <section id="absent-panel" class="reception-panel" role="tabpanel" aria-labelledby="absent-tab" hidden>
+        <h2 id="absent-title" class="list-caption">不在のお客様 <span class="order-note">元の受付順・未案内合計に含む</span></h2>
+        <div class="list-columns" aria-hidden="true"><span>受付番号・受付日</span><span>受付時刻</span><span>人数</span><span>現在状態</span><span>メニュー</span></div>
+        <ol id="absent-list" class="reception-list" aria-label="受付順の不在一覧"></ol>
+        <p id="absent-empty" class="empty-state" hidden>不在の受付はありません。</p>
+      </section>
+      <section id="recent-panel" class="reception-panel" role="tabpanel" aria-labelledby="recent-tab" hidden>
+        <h2 id="recent-title" class="list-caption">案内済みのお客様 <span class="order-note">直近24時間・有効な案内の新しい順</span></h2>
+        <div class="list-columns" aria-hidden="true"><span>受付番号・受付日</span><span>案内時刻／受付時刻</span><span>人数</span><span>現在状態</span><span>メニュー</span></div>
+        <ol id="recent-list" class="reception-list" aria-label="最近の有効な案内済み一覧"></ol>
+        <p id="recent-empty" class="empty-state" hidden>直近24時間の案内完了はありません。</p>
+      </section>
+      </div>
+      <aside id="row-menu" class="row-menu panel" role="region" aria-labelledby="row-menu-title" tabindex="-1" hidden>
+        <div class="section-heading"><h2 id="row-menu-title">受付メニュー</h2><button id="row-menu-close" type="button" class="secondary">閉じる</button></div>
+        <p id="row-menu-status"></p>
+        <p id="row-menu-note" class="preview-note">閲覧専用プレビューです。ここから操作は実行できません。</p>
+        <ul id="row-menu-items" class="preview-actions"></ul>
+      </aside>
+      <section id="detail-view" class="panel detail-panel" aria-labelledby="detail-title" hidden>
+        <div class="section-heading"><h2 id="detail-title" tabindex="-1">受付詳細</h2><button id="detail-close" class="secondary" type="button">詳細を閉じる</button></div>
+        <p class="help">現在の操作対象情報の確認用です。操作はできません。</p>
+        <div id="detail-content"></div>
+      </section>
+    </div>
+    <section id="call-status-view" class="call-status" role="status" aria-live="polite" hidden>
+      <p id="call-status-message"></p>
+      <small id="call-operation-id"></small>
+      <div class="call-recovery-actions">
+        <button id="call-lookup" type="button" class="secondary" hidden>同じ操作IDの結果を照会</button>
+        <button id="call-retry" type="button" class="secondary" hidden>同じID・同じ内容で再送</button>
+      </div>
+    </section>
+    <div id="call-backdrop" class="call-backdrop" aria-hidden="true" hidden></div>
+    <section id="call-confirmation" class="call-confirmation panel" role="dialog" aria-modal="true" aria-labelledby="call-confirm-title" hidden>
+      <h2 id="call-confirm-title">呼出の確認（合成データ限定）</h2>
+      <p>対象を確認してください。確定直前にも最新状態を確認します。</p>
+      <div id="call-confirm-fields"></div>
+      <div class="call-confirm-actions">
+        <button id="call-dismiss" type="button" class="secondary">キャンセル</button>
+        <button id="call-confirm" type="button" class="primary" disabled>呼出を確定</button>
+      </div>
+    </section>
+    <noscript><p class="message">認証を確認できないため受付情報を表示しません。JavaScriptを有効にしてください。</p></noscript>
+  </main>
+  <footer id="staff-footer">閲覧専用 · 状態変更・訂正・通知は未接続です。</footer>
+</body>
+</html>

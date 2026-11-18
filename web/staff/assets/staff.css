@@ -1,0 +1,136 @@
+:root { color-scheme: light; --ink: #18343d; --muted: #586d75; --accent: #126c64; --line: #dce4e2; --paper: #fff; --background: #f4f6f3; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; color: var(--ink); background: var(--background); font: 16px/1.65 system-ui, -apple-system, "Noto Sans JP", sans-serif; }
+button, input { font: inherit; }
+button { min-height: 48px; padding: .6rem 1.1rem; border: 1px solid var(--line); border-radius: .65rem; cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid #cd8800; outline-offset: 4px; }
+.primary { color: white; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+.secondary { color: var(--ink); background: var(--paper); }
+.app-header { min-height: 84px; padding: 1rem max(1.25rem, calc((100vw - 1160px) / 2)); display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-bottom: 1px solid var(--line); background: var(--paper); }
+.brand { color: var(--ink); text-decoration: none; display: flex; align-items: center; gap: .7rem; font-size: 1.2rem; font-weight: 750; }
+.brand-mark { display: inline-grid; place-items: center; width: 38px; height: 38px; background: var(--accent); border-radius: 11px; color: white; }
+.brand-caption { font-size: .75rem; color: var(--muted); font-weight: 500; }
+.staff-main { max-width: 1160px; margin: 2rem auto 3rem; padding: 0 1.25rem; }
+.login-main { max-width: 520px; margin: clamp(2rem, 8vh, 6rem) auto; padding: 0 1.25rem; }
+.panel { background: var(--paper); border: 1px solid var(--line); border-radius: 1rem; padding: 1.6rem; }
+.login-panel { padding: 2rem; }
+.eyebrow { margin: 0 0 .3rem; color: var(--accent); letter-spacing: .14em; font-size: .7rem; font-weight: 750; }
+h1 { margin: 0; font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.5; }
+h2 { margin: 0; font-size: 1.18rem; }
+.help, .updated { font-size: .86rem; color: var(--muted); }
+.updated { margin: .35rem 0 1.2rem; }
+label { display: block; font-weight: 650; margin: 1.6rem 0 .5rem; }
+input { width: 100%; min-height: 52px; padding: .65rem; border: 1px solid #829c9c; border-radius: .6rem; background: white; }
+.login-panel .primary { width: 100%; margin-top: 1rem; }
+.shared-note { padding-top: 1rem; border-top: 1px solid var(--line); margin-top: 1.4rem; }
+.message { padding: .8rem 1rem; border-radius: .6rem; color: #4d4d26; background: #fff5d8; border: 1px solid #ebddb6; font-size: .9rem; }
+.message:empty { display: none; }
+.page-heading, .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.readonly, .order-note { font-size: .75rem; font-weight: 500; color: var(--muted); }
+.readonly { display: inline-block; padding: .2rem .6rem; border: 1px solid var(--line); border-radius: 100px; vertical-align: middle; margin-left: .4rem; background: white; }
+.summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.summary { border: 2px solid var(--line); background: white; color: var(--ink); border-radius: .85rem; }
+.reception-panel { margin: 1.2rem 0; }
+.reception-list { padding: 0; margin: 1rem 0 0; list-style: none; }
+.reception-row { display: grid; grid-template-columns: minmax(220px, 1.25fr) minmax(175px, 1fr) minmax(120px, .8fr) 90px; align-items: center; gap: 1rem; padding: 1rem 0; border-top: 1px solid var(--line); }
+.ticket { justify-self: start; text-align: left; padding: .5rem .75rem; background: #eef6f3; border-color: #c5dcd4; color: #0a5f56; font-weight: 700; }
+.row-time { color: var(--muted); font-size: .85rem; }
+.row-party { font-size: .9rem; }
+.status-label { display: inline-block; justify-self: start; font-size: .82rem; font-weight: 650; border-radius: .35rem; padding: .15rem .5rem; background: #edf3f2; }
+.status-label.called { background: #fff0d6; color: #815409; }
+.status-label.absent { background: #e9edef; color: #4a5961; }
+.empty-state { color: var(--muted); text-align: center; padding: 1.5rem; }
+.detail-panel { border: 2px solid #86b3a7; scroll-margin-top: 1rem; }
+.detail-fields { display: grid; grid-template-columns: minmax(160px, 1fr) 3fr; gap: .65rem 1rem; }
+.detail-fields dt { color: var(--muted); font-size: .9rem; }
+.detail-fields dd { margin: 0; overflow-wrap: anywhere; }
+footer { padding: 1rem 1.25rem 2rem; text-align: center; color: var(--muted); font-size: .8rem; }
+/* Staff dashboard only: login and customer layouts are independent. */
+body[data-staff-page="receptions"] { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+body[data-staff-page="receptions"] .app-header { min-height: 56px; flex: 0 0 auto; padding: 6px 16px; }
+body[data-staff-page="receptions"] .brand-mark { width: 32px; height: 32px; }
+body[data-staff-page="receptions"] .staff-main { flex: 1 1 0; min-height: 0; width: 100%; max-width: 1440px; margin: 0 auto; padding: 10px 16px 8px; display: flex; flex-direction: column; gap: 6px; }
+body[data-staff-page="receptions"] h1 { font-size: 1.35rem; }
+body[data-staff-page="receptions"] .page-heading { flex: 0 0 auto; }
+body[data-staff-page="receptions"] button { min-height: 44px; }
+body[data-staff-page="receptions"] .secondary { padding: 6px 12px; }
+/* Status and last-check time share a reserved slot; polling never inserts a
+   loading paragraph above the list. Long errors scroll inside this slot. */
+.update-status { height: 44px; flex: 0 0 44px; display: grid; min-width: 0; }
+.update-status > p { grid-area: 1 / 1; max-height: 44px; overflow: auto; }
+.call-success { grid-area: 1 / 1; z-index: 1; min-width: 0; height: 44px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; background: #eaf4f0; border: 1px solid #86b3a7; border-radius: 6px; padding-left: 10px; }
+.call-success > span { min-width: 0; max-height: 42px; overflow: auto; font-size: .9rem; line-height: 1.4; }
+#update-status[data-call-notice="true"] > #updated-at { visibility: hidden; }
+body[data-staff-page="receptions"] .call-success button { height: 44px; padding: 4px 12px; line-height: 1; white-space: nowrap; }
+body[data-staff-page="receptions"] .updated { margin: 0; font-size: .75rem; align-self: center; font-variant-numeric: tabular-nums; }
+body[data-staff-page="receptions"] .message { margin: 0; padding: 6px 10px; flex: 0 0 auto; }
+#staff-view { position: relative; min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; gap: 6px; }
+body[data-staff-page="receptions"] .summary-grid { flex: 0 0 auto; gap: 8px; margin: 0; }
+/* One fixed grid above the scrolling list; polling changes only count text. */
+body[data-staff-page="receptions"] .summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto minmax(1.4em, auto); align-items: center; gap: 2px 8px; min-width: 0; min-height: 76px; padding: 6px 12px; text-align: left; }
+.summary-title { font-size: .95rem; font-weight: 700; }
+.summary-metric { display: flex; align-items: baseline; gap: 4px; white-space: nowrap; font-size: .85rem; }
+.summary-metric strong { font-size: clamp(1.3rem, 2.5vw, 1.6rem); line-height: 1.3; font-weight: 750; }
+.tab-count { display: inline-block; min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
+.summary-note { grid-column: 1 / -1; display: flex; flex-wrap: wrap; min-width: 0; min-height: 1.4em; color: var(--muted); font-size: .75rem; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.summary-note > span { white-space: nowrap; }
+.summary[aria-selected="true"] { color: white; background: var(--accent); border-color: var(--accent); }
+.summary[aria-selected="true"] .summary-note { color: inherit; }
+.list-help { margin: 0; color: var(--muted); font-size: .75rem; flex: 0 0 auto; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0 12px; }
+.list-help strong { font-variant-numeric: tabular-nums; }
+.synthetic-preview { margin: 0; padding: 2px 10px; background: #fff0d6; color: #795114; border-radius: 5px; font-size: .75rem; flex: 0 0 auto; }
+.reception-scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-anchor: none; overscroll-behavior-y: contain; scroll-padding-top: 64px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); scrollbar-gutter: stable; }
+body[data-staff-page="receptions"] .reception-panel { margin: 0; padding: 0; }
+.list-caption { position: sticky; top: 0; z-index: 1; height: 32px; display: flex; align-items: center; padding: 4px 12px; margin: 0; font-size: .85rem; background: #eef3f1; }
+.list-caption .order-note { margin-left: 10px; }
+.list-columns, body[data-staff-page="receptions"] .reception-row { display: grid; grid-template-columns: minmax(160px, 1.3fr) minmax(155px, 1.1fr) minmax(140px, 1fr) 86px 52px; column-gap: 12px; align-items: center; }
+.list-columns { position: sticky; top: 32px; z-index: 1; min-height: 28px; padding: 4px 12px; font-size: .72rem; color: var(--muted); background: #f8faf9; border-bottom: 1px solid var(--line); }
+body[data-staff-page="receptions"] .reception-list { margin: 0; padding: 0; }
+body[data-staff-page="receptions"] .reception-row { min-height: 60px; padding: 3px 12px; gap: 0 12px; border-top: 0; border-bottom: 1px solid var(--line); touch-action: pan-y pinch-zoom; }
+.reception-row[data-menu-open="true"] { background: #eaf4f0; box-shadow: inset 4px 0 var(--accent); }
+body[data-staff-page="receptions"] .ticket { display: flex; flex-direction: column; align-items: flex-start; justify-content: center; min-width: 96px; padding: 1px 8px; line-height: 1.2; background: transparent; border-color: transparent; }
+.ticket-main { font-size: 1.18rem; font-weight: 750; }
+.ticket-date { font-size: .7rem; color: var(--muted); font-weight: 500; }
+body[data-staff-page="receptions"] .row-time { display: flex; flex-direction: column; font-size: .78rem; line-height: 1.45; }
+body[data-staff-page="receptions"] .row-party { white-space: nowrap; font-size: .85rem; }
+.menu-toggle { width: 48px; padding: 0; font-size: 1.5rem; font-weight: 700; color: var(--ink); background: white; }
+.row-menu { position: absolute; z-index: 5; right: 8px; bottom: 8px; width: min(390px, calc(100% - 16px)); max-height: calc(100% - 16px); overflow-y: auto; padding: 16px; box-shadow: 0 8px 32px #18343d38; border: 2px solid #86b3a7; }
+.row-menu h2 { font-size: 1rem; }
+.row-menu p { margin: 8px 0; }
+.preview-note { font-size: .85rem; color: #5c4b26; background: #fff5d8; padding: 8px; border-radius: 6px; }
+.preview-actions { margin: 8px 0 0; padding-left: 1.3rem; color: var(--muted); }
+.preview-actions button { width: 100%; }
+.call-status { flex: 0 0 auto; max-height: min(30dvh, 210px); overflow: auto; padding: 8px 12px; border: 2px solid #b88b31; border-radius: 8px; background: #fff5d8; }
+.call-status p { margin: 0; }
+.call-status small { display: block; overflow-wrap: anywhere; }
+.call-recovery-actions, .call-confirm-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
+.call-backdrop { position: fixed; z-index: 9; inset: 0; background: #18343d66; }
+.call-confirmation { position: fixed; z-index: 10; inset: 50% auto auto 50%; transform: translate(-50%, -50%); width: min(640px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; border: 3px solid var(--accent); box-shadow: 0 8px 32px #18343d38; }
+body[data-staff-page="receptions"] .call-confirm-actions button { min-height: 56px; min-width: 160px; }
+body[data-staff-page="receptions"] .detail-panel { position: absolute; z-index: 4; inset: 4px; overflow: auto; padding: 16px; box-shadow: 0 8px 32px #18343d38; }
+body[data-staff-page="receptions"] footer { padding: 3px 12px; flex: 0 0 auto; font-size: .7rem; }
+@media (max-width: 900px) {
+  .list-columns, body[data-staff-page="receptions"] .reception-row { grid-template-columns: minmax(140px, 1.1fr) minmax(135px, 1fr) 126px 72px 48px; column-gap: 6px; }
+}
+@media (max-width: 620px) {
+  /* Keep one group per row; a narrow phone may scroll horizontally as well. */
+  body[data-staff-page="receptions"] .summary { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(2.8em, auto); justify-items: center; padding: 5px 4px; gap: 2px; text-align: center; }
+  .summary-metric strong { font-size: clamp(1.1rem, 4vw, 1.3rem); }
+  .summary-note { justify-content: center; min-height: 2.8em; }
+  body[data-staff-page="receptions"] .reception-panel { min-width: 600px; }
+  body[data-staff-page="receptions"] .staff-main { padding: 6px 8px; }
+}
+@media (max-height: 540px) {
+  body[data-staff-page="receptions"] { min-height: 420px; overflow-y: auto; }
+  body[data-staff-page="receptions"] .reception-scroll { min-height: 120px; }
+}
+@media (max-width: 760px) {
+  .brand-caption { display: none; }
+  .app-header { padding: .8rem 1rem; }
+  .staff-main { margin-top: 1.3rem; padding: 0 1rem; }
+  .panel { padding: 1.2rem; }
+  .detail-fields { grid-template-columns: 1fr; gap: .15rem; }
+  .detail-fields dd { margin-bottom: .7rem; }
+}

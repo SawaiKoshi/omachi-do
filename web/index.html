@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="おまちどうのお客様用受付画面です。参考待ち時間と待ち状況を確認し、ご来店人数を選んで受付できます。">
+  <title>ご来店受付 | おまちどう</title>
+  <link rel="stylesheet" href="/assets/reception.css">
+  <script type="module" src="/assets/reception.mjs"></script>
+</head>
+<body>
+  <header class="brand"><span class="brand-mark" aria-hidden="true">お</span>おまちどう<span class="brand-caption">ご来店受付</span></header>
+  <main>
+    <noscript><p class="message">待ち状況の表示と受付にはJavaScriptが必要です。スタッフにお声がけください。</p></noscript>
+
+    <section id="home-view" class="dashboard" data-prediction="loading" aria-labelledby="home-title">
+      <div class="panel dashboard-hero">
+        <h1 id="home-title" class="visually-hidden" tabindex="-1">待ち時間の目安</h1>
+        <section id="home-prediction" class="home-prediction" aria-labelledby="home-prediction-label">
+          <h2 id="home-prediction-label">大人2名の場合のAI参考待ち時間</h2>
+          <p id="home-prediction-value" class="prediction-value" role="status" aria-live="polite">確認しています…</p>
+          <p class="prediction-caution">待ち組数や空席を含まない目安です。</p>
+          <div class="prediction-tools">
+            <div class="prediction-switch" role="group" aria-label="参考にする大人の人数">
+              <button id="preview-two" type="button" aria-pressed="true" disabled>大人2名</button>
+              <button id="preview-four" type="button" aria-pressed="false" disabled>大人4名</button>
+            </div>
+            <p id="home-prediction-updated" class="updated"></p>
+          </div>
+          <details class="prediction-notes">
+            <summary>参考待ち時間について</summary>
+            <p>人数や受付時刻などをもとにした参考値です。今の待ち組数や席の空き状況を含めた予測ではありません。分表示は1分単位で切り上げています。</p>
+            <p id="home-prediction-raw" class="help prediction-raw" hidden></p>
+            <ul id="home-prediction-warnings"></ul>
+          </details>
+        </section>
+
+        <div class="queue-overview">
+          <p class="queue-total">現在の待ち組数 <span><strong id="queue-count">—</strong> 組</span></p>
+          <p class="help count-note">呼出中・不在のお客様も含みます。</p>
+        </div>
+
+        <div class="start-area">
+          <button id="start-button" class="primary start-button" type="button" disabled>受付する<span aria-hidden="true"> →</span><span class="button-help">次の画面で人数を選んでください</span></button>
+        </div>
+        <aside class="queue-notice" aria-label="ご案内について">
+          <p>人数や席の空き状況により、<strong>ご案内順が前後する場合があります。</strong></p>
+        </aside>
+      </div>
+
+      <div class="dashboard-queue">
+        <section id="receipt-view" class="panel receipt-notice" aria-labelledby="receipt-title" aria-live="polite" hidden>
+          <div class="receipt-heading">
+            <h2 id="receipt-title" tabindex="-1">受付完了</h2>
+            <button id="next-button" type="button" class="secondary">通知を閉じる</button>
+          </div>
+          <div class="receipt-summary">
+            <p class="receipt-ticket">受付番号 <strong id="receipt-number"></strong></p>
+            <p class="receipt-party">受付人数 <strong id="receipt-people"></strong></p>
+          </div>
+        </section>
+
+        <section class="panel queue-panel" aria-labelledby="queue-title">
+          <div class="queue-heading">
+            <h2 id="queue-title">受付済みのお客様</h2>
+            <span class="order-label">受付順</span>
+          </div>
+          <p id="queue-updated" class="updated">まだ更新されていません</p>
+          <p class="help number-help">番号と受付日をあわせてご確認ください。</p>
+          <p id="queue-message" class="message" role="status" hidden></p>
+          <div id="queue-scroll" class="queue-scroll" tabindex="0" role="region" aria-label="受付済みの番号と人数">
+            <div class="callouts">
+              <section id="called-panel" class="status-panel called-panel" aria-labelledby="called-title" hidden>
+                <h2 id="called-title"><span class="status-dot" aria-hidden="true"></span>呼出中の番号</h2>
+                <p class="help">スタッフのご案内をご確認ください。</p>
+                <ul id="called-list" class="status-list"></ul>
+              </section>
+              <section id="absent-panel" class="status-panel absent-panel" aria-labelledby="absent-title" hidden>
+                <h2 id="absent-title"><span class="status-dot" aria-hidden="true"></span>不在の番号</h2>
+                <p class="help">お戻りの際はスタッフにお声がけください。</p>
+                <ul id="absent-list" class="status-list"></ul>
+              </section>
+            </div>
+            <div class="queue-columns" aria-hidden="true"><span>受付番号</span><span>人数</span><span>状態</span></div>
+            <ol id="queue-list" class="queue-list" aria-label="受付順の待ち一覧"></ol>
+            <p id="queue-empty" class="empty-state" hidden>ただいまお待ちのお客様はいません。</p>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="entry-view" class="panel" aria-labelledby="entry-title" hidden>
+      <div class="entry-header">
+        <button id="back-button" class="secondary back-button" type="button" disabled>← 待ち状況に戻る</button>
+        <h1 id="entry-title" tabindex="-1">何名様でお越しですか？</h1>
+      </div>
+      <form id="party-form" novalidate autocomplete="off">
+        <div class="entry-party">
+          <div class="people-grid">
+            <div class="person-control">
+              <label for="adults">大人の人数</label>
+              <div class="stepper">
+                <button type="button" data-person="adults" data-delta="-1" aria-label="大人を1人減らす" disabled>−</button>
+                <input id="adults" name="adults" type="number" inputmode="numeric" min="0" max="100" step="1" value="1" aria-describedby="people-help" disabled>
+                <button type="button" data-person="adults" data-delta="1" aria-label="大人を1人増やす" disabled>＋</button>
+              </div>
+            </div>
+            <div class="person-control">
+              <label for="children">子供の人数</label>
+              <div class="stepper">
+                <button type="button" data-person="children" data-delta="-1" aria-label="子供を1人減らす" disabled>−</button>
+                <input id="children" name="children" type="number" inputmode="numeric" min="0" max="100" step="1" value="0" aria-describedby="people-help" disabled>
+                <button type="button" data-person="children" data-delta="1" aria-label="子供を1人増やす" disabled>＋</button>
+              </div>
+            </div>
+          </div>
+          <div class="party-total">合計 <output id="total-people" for="adults children" aria-live="polite">1</output> 人</div>
+          <p id="people-help" class="help">合計1〜100人で受け付けます。</p>
+        </div>
+        <section id="entry-prediction" class="entry-prediction" aria-labelledby="entry-prediction-label">
+          <h2 id="entry-prediction-label">この人数でのAI参考待ち時間</h2>
+          <p id="entry-prediction-value" class="prediction-value" role="status" aria-live="polite">人数を選ぶと確認できます</p>
+          <p class="prediction-caution">待ち組数や空席を含まない目安です。</p>
+          <p id="entry-prediction-updated" class="updated"></p>
+          <details class="prediction-notes">
+            <summary>参考待ち時間について</summary>
+            <p>人数や受付時刻などをもとにした参考値です。今の待ち組数や席の空き状況を含めた予測ではありません。分表示は1分単位で切り上げています。</p>
+            <p id="entry-prediction-raw" class="help prediction-raw" hidden></p>
+            <ul id="entry-prediction-warnings"></ul>
+          </details>
+        </section>
+        <div class="entry-actions">
+          <p id="form-message" class="message" role="alert" hidden></p>
+          <p id="request-status" class="help" role="status" hidden></p>
+          <button id="submit-button" class="primary" type="submit" disabled>この人数で受付する</button>
+        </div>
+      </form>
+      <div class="entry-guidance">
+        <p class="help entry-reset-note">未送信のまま60秒操作がないと、最初の画面に戻ります。</p>
+        <aside class="queue-notice" aria-label="ご案内について"><p>ご案内順が前後する場合があります。</p></aside>
+      </div>
+    </section>
+  </main>
+  <footer>お困りの際はスタッフにお声がけください。</footer>
+</body>
+</html>
