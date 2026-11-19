@@ -26,13 +26,13 @@ const identityKeys = ['operation_id', 'reception_id', 'database_id'];
 const validIdentity = value => identityKeys.every(key => uuid(value[key]));
 const requestKeys = ['operation_id', 'action', 'expected_revision', 'write_epoch'];
 const validRequest = value => keys(value, requestKeys) && uuid(value.operation_id)
-  && ['call', 'absent'].includes(value.action) && Number.isSafeInteger(value.expected_revision)
+  && ['call', 'absent', 'seat'].includes(value.action) && Number.isSafeInteger(value.expected_revision)
   && value.expected_revision >= 0 && uuid(value.write_epoch);
 const pendingKeys = ['version', 'state', ...identityKeys, 'action', 'request', 'created_at', 'expires_at'];
 const manualKeys = ['version', 'state', ...identityKeys, 'action', 'reason'];
 const manualReasons = new Set(['expired', 'clock_reversed']);
 const validRecord = value => {
-  if (!plain(value) || value.version !== 2 || !validIdentity(value) || !['call', 'absent'].includes(value.action)) return false;
+  if (!plain(value) || value.version !== 2 || !validIdentity(value) || !['call', 'absent', 'seat'].includes(value.action)) return false;
   if (value.state === 'manual') return keys(value, manualKeys) && manualReasons.has(value.reason);
   return value.state === 'pending' && keys(value, pendingKeys) && validRequest(value.request)
     && value.request.operation_id === value.operation_id && value.request.action === value.action && safeTime(value.created_at)
@@ -191,12 +191,13 @@ export function createOperationJournal(options = {}) {
       return current.record ? { ...current, source: 'v2' } : current;
     } catch { return block('storage_unavailable_or_invalid'); }
   };
-  const begin = input => read().kind === 'empty' ? modern.begin(input) : null;
+  const permits = action => options.seatOnly === true ? action === 'seat' : ['call', 'absent'].includes(action);
+  const begin = input => permits(input?.request?.action) && read().kind === 'empty' ? modern.begin(input) : null;
   const requestForRetry = environment => {
     const current = read();
     // Legacy compatibility is deliberately query-only. Its original fixed
     // request stays intact until a definitive receipt and context resolve it.
-    return current.source === 'v2' ? modern.requestForRetry(environment) : null;
+    return current.source === 'v2' && permits(current.record.action) ? modern.requestForRetry(environment) : null;
   };
   const resolve = expected => {
     const current = read();

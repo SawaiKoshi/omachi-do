@@ -13,10 +13,10 @@ const immutable = value => {
 const signature = context => contractSignature({ reception: context.reception,
   metadata: Object.fromEntries(Object.entries(context.metadata).filter(([k]) => k !== 'view_version')) });
 
-export function createStaffOperations({ window: env, fetchImpl, security, now = Date.now, authFailure = () => {} }) {
+export function createStaffOperations({ window: env, fetchImpl, security, now = Date.now, seatOnly = false, authFailure = () => {} }) {
   let journal;
-  try { journal = createOperationJournal({ storage: env.sessionStorage, now }); }
-  catch { journal = createOperationJournal({ now }); }
+  try { journal = createOperationJournal({ storage: env.sessionStorage, now, seatOnly }); }
+  catch { journal = createOperationJournal({ now, seatOnly }); }
   let alive = true, busy = false, lockState = 'checking', releaseLock;
   let authExpired = false, responseGeneration = 0;
   let confirmation = null, confirmationContext = null, phase = 'idle', received = null, receivedVersion = null, resolved = null, lookupVersion = null;
@@ -24,6 +24,9 @@ export function createStaffOperations({ window: env, fetchImpl, security, now = 
   const active = () => alive && !authExpired && secure() && security().active;
   const currentAuth = version => active() && security().version === version;
   const currentRequest = (version, generation) => currentAuth(version) && generation === responseGeneration;
+  // The 8445 UI uses the default. The seat profile has no UI entry point.
+  const permits = action => seatOnly ? env.location.port === '8446' && action === 'seat'
+    : ['call', 'absent'].includes(action);
   const writable = () => active() && security().ready && lockState === 'owned';
   const state = () => journal.read();
   const status = () => {
@@ -71,7 +74,7 @@ export function createStaffOperations({ window: env, fetchImpl, security, now = 
       if (!currentRequest(version, generation)) throw Error('stale');
       // A 401/403 closes access even when an intermediary omits lab headers.
       if ([401, 403].includes(response.status)) { expireAuthentication(); throw Error('auth'); }
-      if (!operationLabResponse(response)) throw Error('environment');
+      if (!operationLabResponse(response, seatOnly ? 'seat' : 'call,absent')) throw Error('environment');
       const value = await Promise.race([response.json(), timeout]);
       if (!currentRequest(version, generation)) throw Error('stale');
       return { status: response.status, value };
@@ -98,7 +101,7 @@ export function createStaffOperations({ window: env, fetchImpl, security, now = 
   }
   async function transmit(record, version, before = null) {
     const fixed = journal.requestForRetry({ database_id: record.database_id, write_epoch: record.request.write_epoch });
-    if (!writable() || !currentAuth(version) || !fixed || contractSignature(fixed) !== contractSignature(record.request)) throw Error('fixed_request');
+    if (!permits(record.action) || !writable() || !currentAuth(version) || !fixed || contractSignature(fixed) !== contractSignature(record.request)) throw Error('fixed_request');
     phase = 'sending';
     const response = await request(`/staff/receptions/${record.reception_id}/operations`, 'POST', JSON.stringify(fixed));
     if (!currentAuth(version)) return false;
@@ -106,7 +109,7 @@ export function createStaffOperations({ window: env, fetchImpl, security, now = 
     return settle(response.value, record, version);
   }
   async function prepare(action, id) {
-    if (!writable() || busy || state().kind !== 'empty' || !['call', 'absent'].includes(action)) return null;
+    if (!writable() || busy || state().kind !== 'empty' || !permits(action)) return null;
     busy = true; clearConfirmation(); const version = security().version;
     try {
       const latest = await context(id);
