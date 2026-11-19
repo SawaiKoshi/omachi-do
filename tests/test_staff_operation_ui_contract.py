@@ -2,6 +2,7 @@
 
 import json
 from contextlib import closing
+from datetime import timedelta
 from pathlib import Path
 import shutil
 import subprocess
@@ -44,13 +45,18 @@ if (record.request.action === 'call') {
     ('call', 'waiting', 'state_changed'), ('call', 'absent', 'state_changed'),
     ('call', 'called', 'no_change'), ('absent', 'called', 'state_changed'),
     ('absent', 'absent', 'no_change'), ('absent', 'waiting', 'rejected'),
+    ('seat', 'waiting', 'state_changed'), ('seat', 'called', 'state_changed'),
+    ('seat', 'absent', 'state_changed'), ('seat', 'seated', 'no_change'), ('seat', 'cancelled', 'rejected'),
     ('absent', 'seated', 'rejected'), ('absent', 'cancelled', 'rejected'),
 ])
 def test_synthetic_api_receipts_match_common_action_contracts(action, status, outcome):
     node = shutil.which('node')
     assert node is not None, 'Node.js is required for the API/JS serialization contract.'
     with synthetic_app(TOKEN, 8445) as wrapper:
-        with TestClient(wrapper, base_url=ORIGIN, client=('127.0.0.1', 50000)) as client:
+        # Exercise the existing protected API in-process for seat. The deployed
+        # 8445 transport still denies seat; it is never configured by this test.
+        app = wrapper.app if action == 'seat' else wrapper
+        with TestClient(app, base_url=ORIGIN, client=('127.0.0.1', 50000)) as client:
             login = client.post('/staff/session', headers={'Origin': ORIGIN, 'X-Staff-Token': TOKEN})
             assert login.status_code == 200
             headers = {'Origin': ORIGIN, 'X-CSRF-Token': login.json()['csrf_token']}
@@ -69,6 +75,10 @@ def test_synthetic_api_receipts_match_common_action_contracts(action, status, ou
             before = client.get(f'{path}/operation-context').json()
             command = {'operation_id': str(uuid4()), 'action': action,
                        'expected_revision': row['revision'], 'write_epoch': before['metadata']['write_epoch']}
+            if action == 'seat':
+                # Verify Python microsecond timestamps against the JS duration check.
+                later_time = wrapper.app.state.store.clock() + timedelta(microseconds=123456)
+                wrapper.app.state.store.clock = lambda: later_time
             result = client.post(f'{path}/operations', json=command, headers=headers)
             assert result.status_code == (409 if outcome == 'rejected' else 200)
             saved = result.json()

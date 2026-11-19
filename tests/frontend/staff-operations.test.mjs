@@ -65,7 +65,7 @@ function harness(t, options = {}) {
   const env = { location: { protocol: 'https:', hostname: 'staff.localhost' },
     navigator: { locks: lockManager }, sessionStorage: storage, crypto: { randomUUID() { issuedIds++; return randomUUID(); } }, AbortController,
     setTimeout, clearTimeout, ...options.env };
-  const client = createStaffOperations({ window: env, security: () => auth, now: () => time,
+  const client = createStaffOperations({ window: env, seatOnly: options.seatOnly, security: () => auth, now: () => time,
     ...(Object.hasOwn(options, 'authFailure')
       ? options.authFailure === undefined ? {} : { authFailure: () => { authFailures++; return options.authFailure(auth); } }
       : { authFailure: () => { authFailures++; auth.active = false; auth.version++; } }),
@@ -86,6 +86,9 @@ function harness(t, options = {}) {
           data.reception.revision = body.expected_revision + 1;
           data.reception.allowed_actions = body.action === 'call' ? ['absent', 'seat', 'cancel'] : ['call', 'seat', 'cancel'];
           if (body.action === 'call') data.reception.called_at = STAMP;
+          if (body.action === 'seat') Object.assign(data.reception, {
+            status: 'seated', seated_at: STAMP, actual_wait_minutes: 10, allowed_actions: [],
+          });
           ledger.set(body.operation_id, receipt(data.reception, body));
         }
         const override = await options.post?.(body, data, ledger, request);
@@ -721,3 +724,83 @@ test('a stopped instance cannot invalidate a recovered replacement with a late 4
   assert.equal(next.client.status().authExpired, false);
   assert.ok(next.client.status().current);
 });
+
+const seatProfile = { seatOnly: true, actions: 'seat',
+  env: { location: { protocol: 'https:', hostname: 'staff.localhost', port: '8446' } } };
+
+for (const status of ['waiting', 'called', 'absent', 'seated', 'cancelled']) {
+  test(`seat initiation from ${status}`, async t => {
+    const h = harness(t, { ...seatProfile, status });
+    const allowed = ['waiting', 'called'].includes(status);
+    assert.equal(await h.execute('seat'), allowed);
+    assert.equal(h.posts().length, Number(allowed));
+  });
+}
+
+test('seat recovery after login queries first and resends the original body', async t => {
+  const h = harness(t, { ...seatProfile, post() { throw Error('lost'); } });
+  assert.equal(await h.execute('seat'), false);
+  h.client.stop();
+  const next = harness(t, { ...seatProfile, storage: h.storage, ledger: h.ledger,
+    lookup: () => response({}, 404, 'seat') });
+  Object.assign(next.data.reception, h.data.reception);
+  assert.equal(await next.client.prepare('seat', ID), null);
+  assert.equal(await next.client.retry(), false);
+  assert.equal(await next.client.lookup(), false);
+  assert.equal(await next.client.retry(), true);
+  assert.equal(next.posts()[0].body, h.posts()[0].body);
+  assert.equal(next.issuedIds(), 0);
+});
+
+for (const port of ['8443', '8444', '8445']) {
+  test(`seat preparation and persisted retries cannot POST on ${port}`, async t => {
+    for (const seatOnly of [true, false]) {
+      const h = harness(t, { seatOnly, actions: seatOnly ? 'seat' : 'call,absent',
+        env: { location: { ...seatProfile.env.location, port } } });
+      assert.equal(await h.execute('seat'), false);
+      // Simulate a surviving record from a seat-capable client.
+      assert.ok(createOperationJournal({ storage: h.storage, now: () => TIME, seatOnly: true }).begin(input('seat')));
+      assert.equal(await h.client.lookup(), false);
+      assert.equal(await h.client.retry(), false);
+      assert.equal(h.posts().length, 0);
+    }
+  });
+}
+
+test('seat receipt checks server time, exact wait, status, revision and immutable fields', async t => {
+  const h = harness(t, seatProfile), before = clone(h.data.reception);
+  assert.equal(await h.execute('seat'), true);
+  const r = h.client.status().receipt, body = JSON.parse(h.posts()[0].body);
+  const record = { reception_id: ID, operation_id: body.operation_id, request: body };
+  for (const mutate of [v => v.reception.actual_wait_minutes++, v => v.reception.seated_at = before.received_at,
+    v => v.reception.status = 'waiting', v => v.resulting_revision++, v => v.reception.prediction.minutes = 1,
+    v => v.reception.called_at = STAMP, v => v.recorded_at = before.received_at]) {
+    const altered = clone(r); mutate(altered);
+    assert.equal(validOperationReceipt(altered, record, before), false);
+  }
+  assert.equal(receiptMatchesCurrent(r, { ...before, revision: r.resulting_revision + 1 }), true);
+});
+
+test('seat profile requires the exact seat capability and rechecks it after POST', async t => {
+  for (const actions of ['call,absent', 'call,absent,seat', '']) {
+    const h = harness(t, { ...seatProfile, actions });
+    assert.equal(await h.execute('seat'), false);
+    assert.equal(h.posts().length, 0);
+  }
+  const h = harness(t, { ...seatProfile, post: (body, data, ledger) => response(ledger.get(body.operation_id)) });
+  assert.equal(await h.execute('seat'), false);
+  assert.equal(h.client.status().journal.kind, 'pending');
+  assert.equal(await h.client.lookup(), true);
+  assert.equal(h.posts().length, 1);
+});
+
+for (const status of [401, 403]) {
+  test(`seat POST ${status} preserves the fixed journal and closes access`, async t => {
+    const h = harness(t, { ...seatProfile, post: () => response({}, status) });
+    assert.equal(await h.execute('seat'), false);
+    assert.equal(h.client.status().journal.record.action, 'seat');
+    assert.equal(h.client.status().authExpired, true);
+    assert.equal(await h.client.retry(), false);
+    assert.equal(h.posts().length, 1);
+  });
+}

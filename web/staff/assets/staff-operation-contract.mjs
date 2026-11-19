@@ -9,21 +9,43 @@ const keys = (value, names) => value && typeof value === 'object' && !Array.isAr
 const RECEIPT_KEYS = ['operation_id', 'reception_id', 'action', 'outcome', 'response_status', 'recorded_at', 'resulting_revision', 'reception', 'error'];
 
 
-export const operationLabResponse = response => response.headers?.get('X-Omachi-Preview') === 'synthetic'
-  && response.headers?.get('X-Omachi-Preview-Actions') === 'call,absent';
+export const operationLabResponse = (response, actions = 'call,absent') => response.headers?.get('X-Omachi-Preview') === 'synthetic'
+  && response.headers?.get('X-Omachi-Preview-Actions') === actions;
 export const operationLabMetadata = value => value?.schema_version === 2 && uuid(value.database_id) && uuid(value.write_epoch)
   && value.staff_write_mode === 'revision_required' && value.write_enabled === true && value.seat_corrections_enabled === false;
 
-function validAbsentReception(value) {
+// Store timestamps carry up to six fractional digits; Date.parse truncates to milliseconds.
+function microsBelowMillisecond(value) {
+  const fraction = value.match(/\.(\d{1,6})(?:Z|[+-]\d{2}:\d{2})$/)?.[1] ?? '';
+  return Number(fraction.padEnd(6, '0').slice(3));
+}
+
+function elapsedMinutes(start, end) {
+  const milliseconds = Date.parse(end) - Date.parse(start);
+  return ((milliseconds * 1000 + microsBelowMillisecond(end) - microsBelowMillisecond(start)) / 1e6) / 60;
+}
+
+function validSeatTimes(row, receipt) {
+  if (row.status !== 'seated' || !stamp(row.received_at) || !stamp(row.seated_at) || row.cancelled_at !== null
+      || !Number.isFinite(row.actual_wait_minutes) || row.actual_wait_minutes < 0) return false;
+  if (row.called_at !== null && (!stamp(row.called_at) || elapsedMinutes(row.received_at, row.called_at) < 0
+      || elapsedMinutes(row.called_at, row.seated_at) < 0)) return false;
+  return row.actual_wait_minutes === elapsedMinutes(row.received_at, row.seated_at)
+    && (receipt.outcome === 'state_changed' ? row.seated_at === receipt.recorded_at
+      : elapsedMinutes(row.seated_at, receipt.recorded_at) >= 0);
+}
+
+function validReception(value, receipt) {
   if (!keys(value, ['id', 'display_number', 'reception_order', 'received_at', 'adults', 'children', 'total_people',
     'status', 'called_at', 'seated_at', 'cancelled_at', 'actual_wait_minutes', 'snapshot', 'prediction'])) return false;
   const s = value.snapshot, p = value.prediction;
   return uuid(value.id) && typeof value.display_number === 'string' && value.display_number.length > 0
     && integer(value.reception_order) && value.reception_order > 0 && stamp(value.received_at)
     && integer(value.adults) && integer(value.children) && value.total_people === value.adults + value.children
-    && value.total_people >= 1 && value.total_people <= 100 && value.status === 'absent' && stamp(value.called_at)
-    && Date.parse(value.called_at) >= Date.parse(value.received_at)
-    && value.seated_at === null && value.cancelled_at === null && value.actual_wait_minutes === null
+    && value.total_people >= 1 && value.total_people <= 100
+    && (receipt.action === 'seat' ? validSeatTimes(value, receipt)
+      : value.status === 'absent' && stamp(value.called_at) && Date.parse(value.called_at) >= Date.parse(value.received_at)
+        && value.seated_at === null && value.cancelled_at === null && value.actual_wait_minutes === null)
     && keys(s, ['captured_at', 'source', 'waiting_groups', 'ahead_groups', 'ahead_same_size_groups', 'party_size_groups'])
     && stamp(s.captured_at) && typeof s.source === 'string'
     && ['waiting_groups', 'ahead_groups', 'ahead_same_size_groups'].every(k => integer(s[k]))
@@ -36,9 +58,9 @@ function validAbsentReception(value) {
     && Array.isArray(p.warnings) && p.warnings.every(v => typeof v === 'string');
 }
 
-function validAbsentReceipt(value, record) {
+function validStaffReceipt(value, record, action) {
   if (!keys(value, RECEIPT_KEYS) || value.operation_id !== record.operation_id || value.reception_id !== record.reception_id
-      || value.action !== 'absent' || !stamp(value.recorded_at)
+      || value.action !== action || !stamp(value.recorded_at)
       || !(value.resulting_revision === null || integer(value.resulting_revision))) return false;
   if (value.outcome === 'rejected') {
     return value.reception === null && keys(value.error, ['code', 'detail'])
@@ -47,7 +69,7 @@ function validAbsentReceipt(value, record) {
       && value.response_status === (value.error.code === 'reception_not_found' ? 404 : 409);
   }
   if (!['state_changed', 'no_change'].includes(value.outcome) || value.response_status !== 200 || value.error !== null
-      || !validAbsentReception(value.reception) || value.reception.id !== record.reception_id || !integer(value.resulting_revision)) return false;
+      || !validReception(value.reception, value) || value.reception.id !== record.reception_id || !integer(value.resulting_revision)) return false;
   if (value.outcome === 'state_changed' && value.resulting_revision === 0) return false;
   return !record.request || value.resulting_revision === record.request.expected_revision + (value.outcome === 'state_changed' ? 1 : 0);
 }
@@ -61,15 +83,19 @@ export const contractSignature = value => JSON.stringify(canonical(value));
 
 export function validOperationReceipt(value, record, before = null) {
   const action = operationAction(record);
-  if (!['call', 'absent'].includes(action) || record.request && record.request.action !== action
-      || !(action === 'call' ? validCallReceipt(value, record) : validAbsentReceipt(value, record))) return false;
+  if (!['call', 'absent', 'seat'].includes(action) || record.request && record.request.action !== action
+      || !(action === 'call' ? validCallReceipt(value, record) : validStaffReceipt(value, record, action))) return false;
   if (value.outcome === 'rejected' || !before) return true;
   const row = value.reception;
   if (!stableFields.every(k => row[k] === before[k])) return false;
   for (const k of ['snapshot', 'prediction']) {
     if (Object.hasOwn(before, k) && contractSignature(row[k]) !== contractSignature(before[k])) return false;
   }
-  if ((action === 'absent' || value.outcome === 'no_change') && row.called_at !== before.called_at) return false;
+  if ((action !== 'call' || value.outcome === 'no_change') && row.called_at !== before.called_at) return false;
+  if (action === 'seat') {
+    if (value.outcome === 'state_changed') return ['waiting', 'called', 'absent'].includes(before.status);
+    return before.status === 'seated' && row.seated_at === before.seated_at && row.actual_wait_minutes === before.actual_wait_minutes;
+  }
   if (value.outcome === 'state_changed') {
     return action === 'call' ? ['waiting', 'absent'].includes(before.status) : before.status === 'called';
   }
@@ -90,9 +116,13 @@ export function validOperationContext(value, id) {
     && Array.isArray(row.allowed_actions) && row.allowed_actions.every(v => ['call', 'absent', 'return', 'seat', 'cancel'].includes(v));
 }
 
-export const canApplyOperation = (action, row) => ['call', 'absent'].includes(action)
-  && row.allowed_actions.includes(action)
-  && (action === 'call' ? ['waiting', 'absent'].includes(row.status) : row.status === 'called');
+// Starting a seat command is deliberately narrower than validating an API receipt.
+export function canApplyOperation(action, row) {
+  if (!row.allowed_actions.includes(action)) return false;
+  if (action === 'seat') return ['waiting', 'called'].includes(row.status);
+  if (action === 'call') return ['waiting', 'absent'].includes(row.status);
+  return action === 'absent' && row.status === 'called';
+}
 
 // Historical receipts are never returned as the current row. Advancing beyond
 // a successful operation is valid; a same-revision status disagreement is not.
