@@ -742,7 +742,7 @@ def test_real_verified_tls_call_absent_cookie_csrf_replay_and_other_action_denia
 
 
 @pytest.mark.parametrize('port', [8443, 8444])
-@pytest.mark.parametrize('action', ['call', 'absent'])
+@pytest.mark.parametrize('action', ['call', 'absent', 'seat'])
 def test_existing_labs_keep_their_original_write_boundaries(port, action):
     from staff_https_lab import synthetic_app as readonly_app
     from staff_call_https_lab import synthetic_app as call_app

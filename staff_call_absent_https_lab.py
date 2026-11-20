@@ -56,6 +56,61 @@ def _invalid_constant(value):
     raise ValueError("Non-JSON number")
 
 
+class InvalidOperationBody(Exception):
+    def __init__(self, status):
+        super().__init__(status)
+        self.status = status
+
+
+async def read_operation_request(scope, receive):
+    """Bound and validate the original request bytes before either lab authorizes its action."""
+    def values(name):
+        return [value for key, value in scope["headers"] if key.lower() == name]
+
+    content_types = values(b"content-type")
+    if (scope.get("query_string") or len(content_types) != 1
+            or content_types[0].split(b";", 1)[0].strip().lower() != b"application/json"
+            or values(b"content-encoding")):
+        raise InvalidOperationBody(422)
+    lengths = values(b"content-length")
+    if lengths and (len(lengths) != 1 or not lengths[0].isdigit()):
+        raise InvalidOperationBody(422)
+    if lengths and (len(lengths[0]) > 5 or int(lengths[0]) > MAX_BODY_BYTES):
+        raise InvalidOperationBody(413)
+    body = bytearray()
+    try:
+        async with asyncio.timeout(BODY_TIMEOUT_SECONDS):
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    return None  # Client disconnected.
+                body.extend(message.get("body", b""))
+                if len(body) > MAX_BODY_BYTES:
+                    raise InvalidOperationBody(413)
+                if not message.get("more_body", False):
+                    break
+    except TimeoutError:
+        raise InvalidOperationBody(408)
+    try:
+        if lengths and int(lengths[0]) != len(body):
+            raise ValueError("Body length mismatch")
+        payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object,
+                             parse_constant=_invalid_constant)
+        command = StaffOperationInput.model_validate(payload)
+    except (ValueError, ValidationError, RecursionError):
+        raise InvalidOperationBody(422)
+    # Only a gate that authorizes the validated action forwards these exact bytes.
+    async def replay_receive():
+        nonlocal body
+        if body is None:
+            return await receive()
+        message = {"type": "http.request", "body": bytes(body), "more_body": False}
+        body = None
+        return message
+
+    return command, replay_receive
+
+
 class CallAbsentLab:
     """Narrow transport gate; authentication and transitions stay in the app.
 
@@ -101,56 +156,17 @@ class CallAbsentLab:
         if scope["method"] != "POST" or not OPERATIONS_PATH.fullmatch(path):
             await self.readonly(scope, receive, preview_send)
             return
-        content_types = values(b"content-type")
-        if (scope.get("query_string") or len(content_types) != 1
-                or content_types[0].split(b";", 1)[0].strip().lower() != b"application/json"
-                or values(b"content-encoding")):
-            await reject(422)
-            return
-        lengths = values(b"content-length")
-        if lengths and (len(lengths) != 1 or not lengths[0].isdigit()):
-            await reject(422)
-            return
-        if lengths and (len(lengths[0]) > 5 or int(lengths[0]) > MAX_BODY_BYTES):
-            await reject(413)
-            return
-        body = bytearray()
         try:
-            async with asyncio.timeout(BODY_TIMEOUT_SECONDS):
-                while True:
-                    message = await receive()
-                    if message["type"] != "http.request":
-                        return  # Disconnect before validation: nothing forwarded.
-                    body.extend(message.get("body", b""))
-                    if len(body) > MAX_BODY_BYTES:
-                        await reject(413)
-                        return
-                    if not message.get("more_body", False):
-                        break
-        except TimeoutError:
-            await reject(408)
+            parsed = await read_operation_request(scope, receive)
+        except InvalidOperationBody as exc:
+            await reject(exc.status)
             return
-        try:
-            if lengths and int(lengths[0]) != len(body):
-                raise ValueError("Body length mismatch")
-            payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object,
-                                 parse_constant=_invalid_constant)
-            command = StaffOperationInput.model_validate(payload)
-        except (ValueError, ValidationError, RecursionError):
-            await reject(422)
+        if parsed is None:
             return
+        command, replay_receive = parsed
         if command.action not in ("call", "absent"):
             await reject()
             return
-
-        delivered = False
-
-        async def replay_receive():
-            nonlocal delivered
-            if not delivered:
-                delivered = True
-                return {"type": "http.request", "body": bytes(body), "more_body": False}
-            return await receive()
 
         # Original, validated bytes go through the existing Cookie/Origin/CSRF,
         # protected route and atomic store operation. No alternate API fallback.
@@ -158,7 +174,7 @@ class CallAbsentLab:
 
 
 @contextmanager
-def synthetic_app(token, port=PORT):
+def synthetic_protected_app(token, port, *, microseconds=0):
     validate_credential(token)
     validate_port(port)
     with temporary_workspace() as workspace:
@@ -191,17 +207,23 @@ def synthetic_app(token, port=PORT):
                     ("revision_required", 0)]:
                 raise LabConfigurationError("synthetic_database")
             conn.commit()
-        frozen_time = BASE + timedelta(minutes=2)
+        frozen_time = BASE + timedelta(minutes=2, microseconds=microseconds)
         app = create_app(
             db_path=database, model_path=workspace.root / "no-model-in-this-synthetic-lab.joblib",
             staff_token=token, staff_browser_origin=f"https://staff.localhost:{port}",
             clock=lambda: frozen_time,
         )
+        yield app
+
+
+@contextmanager
+def synthetic_app(token, port=PORT):
+    with synthetic_protected_app(token, port) as app:
         yield CallAbsentLab(app, port)
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Synthetic call+absent API and verified browser UI, fixed port 8445.")
+def run_https_lab(argv, *, port, factory, label, usage):
+    parser = argparse.ArgumentParser(description=f"Synthetic {label} HTTPS lab, fixed port {port}.")
     parser.add_argument("--cert", required=True, help="Development TLS certificate outside this repository")
     parser.add_argument("--key", required=True, help="Owner-only development private key outside this repository")
     parser.add_argument("--check", action="store_true", help="Validate and prepare disposable DB without starting a server")
@@ -210,7 +232,7 @@ def main(argv=None):
     try:
         cert, key = validate_tls(args.cert, args.key)
         stage = "port_unavailable"
-        check_loopback_port(PORT)
+        check_loopback_port(port)
         stage = "credential_input"
         token = os.environ.get("OMACHI_LAB_STAFF_TOKEN")
         if token is None:
@@ -219,15 +241,15 @@ def main(argv=None):
             token = getpass("Development shared staff credential (32+ printable ASCII characters; hidden): ")
         validate_credential(token)
         stage = "synthetic_database"
-        with synthetic_app(token, PORT) as app:
+        with factory(token, port) as app:
             if args.check:
-                print("[check_ok] TLS, credential and disposable call+absent DB passed; no server started.", flush=True)
+                print(f"[check_ok] TLS, credential and disposable {label} DB passed; no server started.", flush=True)
                 return 0
-            print(f"Synthetic call+absent API only: https://staff.localhost:{PORT}/staff/login", flush=True)
-            print("Synthetic browser UI: call+absent only, with confirmation and shared recovery. Run only one staff.localhost lab at a time; resolve pending operations before switching ports (cookies share the host).", flush=True)
+            print(f"Synthetic {label} API only: https://staff.localhost:{port}/staff/login", flush=True)
+            print(f"{usage} Run only one staff.localhost lab at a time; resolve pending operations before switching ports (cookies share the host).", flush=True)
             stage = "server_startup"
             uvicorn.run(
-                app, host="127.0.0.1", port=PORT, workers=1, reload=False,
+                app, host="127.0.0.1", port=port, workers=1, reload=False,
                 proxy_headers=False, forwarded_allow_ips="", access_log=False,
                 log_level="warning", ssl_certfile=cert, ssl_keyfile=key,
                 ssl_keyfile_password="", ssl_version=ssl.PROTOCOL_TLS_SERVER,
@@ -235,14 +257,19 @@ def main(argv=None):
             stage = "synthetic_database"
     except Exception as exc:
         code = exc.code if isinstance(exc, LabConfigurationError) else stage
-        parser.exit(2, f"The call+absent HTTPS lab could not start. [{code}] {DIAGNOSTICS[code]}\n")
+        parser.exit(2, f"The {label} HTTPS lab could not start. [{code}] {DIAGNOSTICS[code]}\n")
     except SystemExit as exc:
         if stage != "server_startup" or exc.code in (None, 0):
             raise
-        parser.exit(2, f"The call+absent HTTPS lab could not start. [server_startup] {DIAGNOSTICS['server_startup']}\n")
+        parser.exit(2, f"The {label} HTTPS lab could not start. [server_startup] {DIAGNOSTICS['server_startup']}\n")
     except KeyboardInterrupt:
-        parser.exit(130, "Call+absent HTTPS lab cancelled.\n")
+        parser.exit(130, f"{label} HTTPS lab cancelled.\n")
     return 0
+
+
+def main(argv=None):
+    return run_https_lab(argv, port=PORT, factory=synthetic_app, label="call+absent",
+                        usage="Synthetic browser UI: call+absent only, with confirmation and shared recovery.")
 
 
 if __name__ == "__main__":
