@@ -1,12 +1,12 @@
-// Presentation adapter for the verified 8445 synthetic lab only.
+// Presentation adapter for the verified 8445 and 8446 synthetic labs.
 // Persistence, locks, requests and receipt validation belong to the foundation.
 import { createStaffOperations } from './staff-operations.mjs';
 import { canApplyOperation, operationLabMetadata } from './staff-operation-contract.mjs';
 
 const LABELS = { waiting: '待機中', called: '呼出中', absent: '不在', seated: '案内済み', cancelled: '取消済み' };
-const ACTIONS = { call: '呼出', absent: '不在' };
+const ACTIONS = { call: '呼出', absent: '不在', seat: '案内完了' };
 
-export function createStaffOperationUI({ document: doc, window: env, fetchImpl, now, security,
+export function createStaffOperationUI({ document: doc, window: env, fetchImpl, now, seatOnly = false, security,
   refresh, authFailure, rowSignature, metadataSignature }) {
   const get = id => doc.getElementById(id);
   const text = (id, value) => { if (get(id) && get(id).textContent !== value) get(id).textContent = value; };
@@ -21,10 +21,11 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     && rowSignature(a.reception) === rowSignature(b.reception);
   function submissionCurrent() {
     if (!submission) return true;
-    const row = snapshot?.rows.find(r => r.id === submission.reception.id);
-    return Boolean(row && same(submission, { reception: row, metadata: snapshot.metadata }));
+    if (submission.version !== confirmationVersion) return false;
+    const row = snapshot?.rows.find(r => r.id === submission.context.reception.id);
+    return Boolean(row && same(submission.context, { reception: row, metadata: snapshot.metadata }));
   }
-  const engine = createStaffOperations({ window: env, fetchImpl, now, security: () => {
+  const engine = createStaffOperations({ window: env, fetchImpl, now, seatOnly, security: () => {
     const auth = security();
     // Keep the foundation's final pre-UUID readiness check false when a
     // newer background snapshot invalidated an in-flight confirmation.
@@ -75,9 +76,9 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     if (!active() || state.authExpired) { closeDisplay(); return; }
     const pending = ['pending', 'manual'].includes(state.journal.kind);
     let value = message;
-    if (state.journal.kind === 'blocked') value = '復旧情報を安全に確認できません。呼出・不在を停止しています。管理者による確認が必要です。';
+    if (state.journal.kind === 'blocked') value = '復旧情報を安全に確認できません。操作を停止しています。管理者による確認が必要です。';
     else if (!busy && state.journal.kind === 'manual') value = '復旧期限超過・要手動確認です。再送はしません。同じ操作IDの結果を照会してください。';
-    else if (pending && !value) value = '結果不明・要照会です。新しい呼出・不在は開始できません。';
+    else if (pending && !value) value = '結果不明・要照会です。新しい操作は開始できません。';
     else if (!value && state.lockState !== 'owned') value = '別タブで利用中、または安全なタブ間排他が利用できないため、このタブでは操作できません。';
     text('call-status-message', value); hide('call-status-view', !value && !pending);
     text('call-operation-id', pending ? `操作ID：${state.journal.record.operation_id}` : '');
@@ -112,6 +113,7 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
       add('受付日時', new Date(r.received_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }));
       add('人数', `大人 ${r.adults}名 · 子供 ${r.children}名`); add('現在状態', LABELS[r.status]); add('実行する操作', ACTIONS[action]);
       get('call-confirm-fields').replaceChildren(fields);
+      if (action === 'seat') text('call-confirm-guidance', 'お客様をご案内するタイミングで確定してください');
       text('call-confirm-title', `${ACTIONS[action]}の確認（合成データ限定）`); text('call-confirm', `${ACTIONS[action]}を確定`);
       message = `${ACTIONS[action]}確認中です。内容を確認して確定してください。`;
       hide('call-confirmation', false); get('call-dismiss')?.focus();
@@ -138,13 +140,16 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     const before = engine.status();
     if (!active() || before.authExpired || busy || preparing || method === 'confirm' && !ticket) return false;
     const selected = ticket, auth = security().version;
-    submission = method === 'confirm' ? selected.context : null;
+    const context = method === 'confirm' ? selected.context : null;
+    const focusRow = selected?.action === 'seat' && get('call-confirmation')?.contains(doc.activeElement) ? returnFocus : null;
     recoveredVersion = auth;
     busy = true; clearSuccess(); settled = null;
     phase = method === 'lookup' ? 'checking' : 'sending';
     message = method === 'lookup' ? '保存された操作結果と現在状態を照会しています。'
       : '最新状態を確認・送信中です。結果が確定するまで新しい操作はできません。';
-    invalidate(); render();
+    invalidate();
+    submission = context ? { context, version: confirmationVersion } : null;
+    render(); focusRow?.();
     try {
       const result = await engine[method](...(method === 'confirm' ? [selected] : []));
       if (!current(auth)) return false;
