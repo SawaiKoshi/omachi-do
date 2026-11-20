@@ -1,4 +1,4 @@
-// Protected foundation, used only by the explicitly gated synthetic 8445 UI.
+// Protected foundation, used only by the explicitly gated synthetic staff UI.
 import { createOperationJournal } from './staff-operation-journal.mjs';
 import { operationLabResponse, validOperationContext, validOperationReceipt,
   canApplyOperation, contractSignature, receiptMatchesCurrent } from './staff-operation-contract.mjs';
@@ -24,7 +24,7 @@ export function createStaffOperations({ window: env, fetchImpl, security, now = 
   const active = () => alive && !authExpired && secure() && security().active;
   const currentAuth = version => active() && security().version === version;
   const currentRequest = (version, generation) => currentAuth(version) && generation === responseGeneration;
-  // The 8445 UI uses the default. The seat profile has no UI entry point.
+  // The 8445 UI uses the default. The 8446 UI explicitly selects the seat profile.
   const permits = action => seatOnly ? env.location.port === '8446' && action === 'seat'
     : ['call', 'absent'].includes(action);
   const writable = () => active() && security().ready && lockState === 'owned';

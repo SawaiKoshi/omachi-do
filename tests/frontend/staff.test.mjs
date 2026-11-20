@@ -22,7 +22,7 @@ const IDS = [
   'row-menu', 'row-menu-title', 'row-menu-status', 'row-menu-items', 'row-menu-close', 'synthetic-preview',
   'row-menu-note', 'staff-access-label', 'staff-list-help', 'staff-footer',
   'call-status-view', 'call-status-message', 'call-operation-id', 'call-lookup', 'call-retry',
-  'call-backdrop', 'call-confirmation', 'call-confirm-title', 'call-confirm-fields', 'call-dismiss', 'call-confirm',
+  'call-backdrop', 'call-confirmation', 'call-confirm-title', 'call-confirm-guidance', 'call-confirm-fields', 'call-dismiss', 'call-confirm',
   'update-status', 'call-success-view', 'call-success-message', 'call-success-close',
 ];
 
@@ -166,7 +166,7 @@ function deferred() {
 }
 
 function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [], now = 0, page = 'receptions',
-  callLab = false, operationLab = false, storage, lockAvailable = true, locksSupported = true, lockManager } = {}) {
+  callLab = false, operationLab = false, seatLab = false, storage, lockAvailable = true, locksSupported = true, lockManager } = {}) {
   const elements = new Map(IDS.map(id => [id, new Element(id)]));
   const doc = Object.assign(new Target(), {
     visibilityState: 'visible', hidden: false, activeElement: null,
@@ -199,7 +199,10 @@ function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [
     setTimeout(handler, delay) { timerId += 1; timers.set(timerId, { handler, at: time + delay }); return timerId; },
     clearTimeout(id) { timers.delete(id); },
   });
-  if (operationLab) Object.assign(env.location, { port: '8445', origin: 'https://staff.localhost:8445', href: 'https://staff.localhost:8445/staff/' });
+  if (operationLab) {
+    const port = seatLab ? '8446' : '8445', origin = `https://staff.localhost:${port}`;
+    Object.assign(env.location, { port, origin, href: origin + '/staff/' });
+  }
   for (const name of ['localStorage', 'sessionStorage']) {
     Object.defineProperty(env, name, { get() {
       if ((callLab || operationLab) && name === 'sessionStorage' && storage) return storage;
@@ -228,7 +231,7 @@ function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [
   };
   function withCapability(result) {
     if ((callLab || operationLab) && !result.headers) result.headers = { get: name => ({
-      'X-Omachi-Preview': 'synthetic', 'X-Omachi-Preview-Actions': operationLab ? 'call,absent' : 'call',
+      'X-Omachi-Preview': 'synthetic', 'X-Omachi-Preview-Actions': seatLab ? 'seat' : operationLab ? 'call,absent' : 'call',
     })[name] ?? null };
     return result;
   }
@@ -2367,8 +2370,9 @@ function operationHarness(options = {}) {
   const h = harness({ ...options, rows, storage, operationLab: true, callLab: false, fetch: async (url, request) => {
     if (url.endsWith('/operation-context')) {
       contexts++;
-      const override = await options.context?.(rows[0], contexts, url, request);
-      return override ?? response({ metadata: metadata(options.meta), reception: { ...rows[0] } });
+      const row = rows.find(r => url === `/staff/receptions/${r.id}/operation-context`);
+      const override = await options.context?.(row, contexts, url, request);
+      return override ?? response({ metadata: metadata(options.meta), reception: { ...row } });
     }
     if (url.startsWith('/staff/operations/')) {
       const override = await options.lookup?.(url, request);
@@ -2377,31 +2381,47 @@ function operationHarness(options = {}) {
     }
     if (url.endsWith('/operations') && request.method === 'POST') {
       const body = JSON.parse(request.body);
-      assert.ok(['call', 'absent'].includes(body.action));
+      assert.ok(options.seatLab ? body.action === 'seat' : ['call', 'absent'].includes(body.action));
       assert.deepEqual(JSON.parse(storage.getItem(OPERATION_JOURNAL_KEY)).request, body);
       assert.equal(request.headers['X-CSRF-Token'], session().csrf_token);
       assert.equal(request.headers['X-Staff-Token'], undefined);
       const apply = () => {
         if (!ledger.has(body.operation_id)) {
-          rows[0] = { ...rows[0], revision: body.expected_revision + 1, status: body.action === 'call' ? 'called' : 'absent',
-            called_at: body.action === 'call' ? '2026-11-01T18:10:00+09:00' : rows[0].called_at,
-            allowed_actions: body.action === 'call' ? ['absent', 'seat', 'cancel'] : ['call', 'return', 'seat', 'cancel'] };
-          ledger.set(body.operation_id, { ...callReceipt(rows[0], body), action: body.action });
+          if (body.action === 'seat') {
+            const index = rows.findIndex(r => url === `/staff/receptions/${r.id}/operations`), before = rows[index];
+            const seated = seatedRow(before.reception_order);
+            seated.valid_seating_event.from_status = before.status;
+            rows[index] = { ...before, status: 'seated', revision: body.expected_revision + 1, called_at: before.called_at,
+              seated_at: seated.seated_at, actual_wait_minutes: seated.actual_wait_minutes,
+              valid_seating_event: seated.valid_seating_event, allowed_actions: [] };
+            ledger.set(body.operation_id, { ...callReceipt(rows[index], body), action: 'seat', recorded_at: seated.seated_at });
+          } else {
+            rows[0] = { ...rows[0], revision: body.expected_revision + 1, status: body.action === 'call' ? 'called' : 'absent',
+              called_at: body.action === 'call' ? '2026-11-01T18:10:00+09:00' : rows[0].called_at,
+              allowed_actions: body.action === 'call' ? ['absent', 'seat', 'cancel'] : ['call', 'return', 'seat', 'cancel'] };
+            ledger.set(body.operation_id, { ...callReceipt(rows[0], body), action: body.action });
+          }
         }
         return response(ledger.get(body.operation_id));
       };
       const override = await options.post?.(body, request, rows, ledger, apply);
       return override ?? apply();
     }
-    return options.fetch?.(url, request);
+    const override = await options.fetch?.(url, request);
+    if (override === undefined && options.seatLab && url.startsWith('/staff/receptions?')) {
+      const view = new URL(url, 'https://staff.localhost:8446').searchParams.get('view');
+      const visible = rows.filter(r => view === 'active' ? ['waiting', 'called', 'absent'].includes(r.status) : r.status === 'seated');
+      return response(listing(visible, view));
+    }
+    return override;
   } });
   const posts = () => h.requests.filter(r => r.method === 'POST' && r.url.endsWith('/operations'));
   return { ...h, rows, storage, ledger, posts,
-    async open(action = 'call') {
-      const view = rows[0].status === 'absent' ? 'absent' : 'active';
+    async open(action = options.seatLab ? 'seat' : 'call', index = 0) {
+      const view = rows[index].status === 'absent' ? 'absent' : 'active';
       await h.el(`${view}-tab`).emit('click');
-      await rowTrigger(rowItem(h, 0, view)).emit('click');
-      const button = h.el('row-menu-items').children.flatMap(item => item.children).find(item => item.textContent === `${action === 'call' ? '呼出' : '不在'}を確認`);
+      await rowTrigger(rowItem(h, index, view)).emit('click');
+      const button = h.el('row-menu-items').children.flatMap(item => item.children).find(item => item.textContent === `${action === 'seat' ? '案内完了' : action === 'call' ? '呼出' : '不在'}を確認`);
       assert.ok(button, `Expected ${action} confirmation item`); await button.emit('click'); await settle();
     },
     async confirm() { await h.el('call-confirm').emit('click'); await settle(); await settle(); },
@@ -2515,8 +2535,8 @@ for (const action of ['call', 'absent']) {
   });
 }
 
-test('8445 persisted rejection never auto-hides or changes reception state', async () => {
-  const h = operationHarness({ post: (body, _, rows, ledger) => {
+for (const seatLab of [false, true]) test(`${seatLab ? 8446 : 8445} persisted rejection never auto-hides or changes reception state`, async () => {
+  const h = operationHarness({ seatLab, post: (body, _, rows, ledger) => {
     const receipt = { operation_id: body.operation_id, reception_id: rows[0].id, action: body.action,
       recorded_at: '2026-11-01T18:10:00+09:00', resulting_revision: 0, reception: null,
       outcome: 'rejected', response_status: 409, error: { code: 'revision_conflict', detail: 'synthetic conflict' } };
@@ -2555,8 +2575,8 @@ for (const denial of [401, 403]) {
     assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), saved); assert.equal(h.posts().length, 1);
     assert.ok(h.redirects.includes('/staff/login')); h.controller.stop();
   });
-  test(`8445 ${denial} from operation context closes UI before a new POST`, async () => {
-    const h = operationHarness({ context: (_, n) => n === 2 ? response({}, denial) : undefined });
+  for (const seatLab of [false, true]) test(`${seatLab ? 8446 : 8445} ${denial} from operation context closes UI before a new POST`, async () => {
+    const h = operationHarness({ seatLab, context: (_, n) => n === 2 ? response({}, denial) : undefined });
     await h.start(); await h.open(); await h.confirm(); assertHidden(h);
     assert.equal(h.el('call-confirm-fields').textContent, ''); assert.equal(h.posts().length, 0); h.controller.stop();
   });
@@ -2977,3 +2997,119 @@ for (const failure of [401, 403, 409, 'network']) {
     assert.equal(h.el('unseated-count').textContent, '—'); h.controller.stop();
   });
 }
+
+for (const status of ['waiting', 'called']) {
+  test(`8446 confirms, cancels and seats the selected ${status} reception once`, async () => {
+    const target = reception(2, { status, called_at: status === 'called' ? '2026-11-01T18:05:00+09:00' : null,
+      allowed_actions: ['call', 'absent', 'seat'] });
+    const gate = deferred();
+    const h = operationHarness({ seatLab: true, rows: [reception(), target], post: async (_, __, ___, ____, apply) => {
+      await gate.promise; return apply();
+    } });
+    await h.start();
+    await rowTrigger(rowItem(h, 1)).emit('click');
+    assert.deepEqual(h.el('row-menu-items').children.flatMap(x => x.children.map(b => b.textContent)), ['案内完了を確認']);
+    await h.open('seat', 1);
+    assert.match(h.el('call-confirm-fields').textContent, /20261101-002.*大人 2名.*子供 1名/s);
+    assert.equal(h.el('call-confirm-guidance').textContent, 'お客様をご案内するタイミングで確定してください');
+    assert.ok(h.el('call-confirm-fields').textContent.includes(status === 'waiting' ? '待機中' : '呼出中'));
+    assert.equal(h.doc.activeElement, h.el('call-dismiss'));
+    await h.el('call-dismiss').emit('click');
+    assert.equal(h.posts().length, 0);
+    assert.equal(h.doc.activeElement, rowTrigger(rowItem(h, 1)));
+    await h.open('seat', 1);
+    await Promise.all([h.confirm(), h.confirm()]);
+    assert.equal(h.posts().length, 1);
+    assert.equal(h.posts()[0].url, `/staff/receptions/${target.id}/operations`);
+    assert.equal(h.el('unseated-count').textContent, '2');
+    assert.equal(h.el('recent-list').children.length, 0);
+    gate.resolve(); await settle(); await settle(); await settle();
+    assert.equal(h.el('active-tab').getAttribute('aria-selected'), 'true');
+    assert.equal(rowItem(h).dataset.receptionId, reception().id);
+    assert.equal(rowItem(h, 0, 'recent').dataset.receptionId, target.id);
+    assert.deepEqual(['active-tab-count', 'recent-tab-count', 'unseated-count'].map(k => h.el(k).textContent), ['1', '1', '1']);
+    assert.match(rowItem(h, 0, 'recent').textContent, /18:25/);
+    assert.match(h.el('call-success-message').textContent, /案内完了成功.*最新一覧/);
+    assert.deepEqual(h.posts().map(r => JSON.parse(r.body).action), ['seat']);
+    h.controller.stop();
+  });
+}
+
+test('8446 does not offer seat on absent or seated rows even with an extra allowed action', async () => {
+  const h = operationHarness({ seatLab: true, rows: [reception(1, { status: 'absent', allowed_actions: ['seat', 'call'] }),
+    { ...seatedRow(2), allowed_actions: ['seat', 'absent'] }, reception(3, { status: 'cancelled' })] });
+  await h.start();
+  for (const view of ['absent', 'recent']) {
+    await h.el(`${view}-tab`).emit('click'); await rowTrigger(rowItem(h, 0, view)).emit('click');
+    assert.equal(h.el('row-menu-items').children.flatMap(x => x.children).length, 0);
+  }
+  assert.doesNotMatch(h.el('row-menu-items').textContent, /案内完了/);
+  assert.equal(h.el('active-list').children.length, 0);
+  assert.equal(h.posts().length, 0); h.controller.stop();
+});
+
+test('8446 recovers the lost seat result by ID after login, with no second POST', async () => {
+  const first = operationHarness({ seatLab: true, post: (_, __, ___, ____, apply) => { apply(); throw Error('lost'); } });
+  await first.start(); await first.open(); await first.confirm();
+  assert.match(first.el('call-status-message').textContent, /結果不明/);
+  const saved = JSON.parse(first.storage.getItem(OPERATION_JOURNAL_KEY));
+  await rowTrigger(rowItem(first)).emit('click');
+  assert.equal(first.el('row-menu-items').children.flatMap(x => x.children).length, 0);
+  first.controller.stop(); await settle();
+  const next = operationHarness({ seatLab: true, rows: first.rows, storage: first.storage, ledger: first.ledger });
+  await next.start(); await settle(); await settle();
+  assert.ok(next.requests.some(r => r.url === `/staff/operations/${saved.operation_id}`));
+  assert.equal(next.posts().length, 0); assert.equal(next.storage.getItem(OPERATION_JOURNAL_KEY), null);
+  assert.match(next.el('call-success-message').textContent, /案内完了成功/);
+  assert.equal(next.el('unseated-count').textContent, '0'); next.controller.stop();
+});
+
+test('8446 mismatched session capability closes confirmation before a delayed list completes', async () => {
+  let lost = false; const gate = deferred();
+  const h = operationHarness({ seatLab: true, fetch: async url => {
+    if (lost && url === '/staff/session') return { ...response(session()), headers: { get: k => k === 'X-Omachi-Preview' ? 'synthetic' : 'call' } };
+    if (lost && url.startsWith('/staff/receptions?')) await gate.promise;
+  } });
+  await h.start(); await h.open(); lost = true; const poll = h.controller.refresh(); await settle();
+  assert.equal(h.el('call-confirmation').hidden, true);
+  await h.confirm(); assert.equal(h.posts().length, 0);
+  gate.resolve(); await poll; await rowTrigger(rowItem(h)).emit('click');
+  assert.equal(h.el('row-menu-items').children.flatMap(x => x.children).length, 0);
+  h.controller.stop();
+});
+
+for (const port of ['8443', '8444', '8445']) {
+  test(`seat headers on ${port} cannot enable the seat UI`, async () => {
+    const h = operationHarness({ seatLab: true });
+    h.env.location.port = port;
+    await h.start(); await rowTrigger(rowItem(h)).emit('click');
+    assert.equal(h.el('row-menu-items').children.flatMap(x => x.children).length, 0);
+    assert.equal(h.posts().length, 0); h.controller.stop();
+  });
+}
+
+test('8446 requires seat on every page of both lists', async () => {
+  const h = operationHarness({ seatLab: true, fetch: url => {
+    if (!url.startsWith('/staff/receptions?')) return;
+    const params = new URL(url, 'https://staff.localhost:8446').searchParams;
+    if (params.get('view') !== 'active') return;
+    if (!params.has('cursor')) return response(listing([reception()], 'active', { has_more: true, next_cursor: 'p2' }));
+    return { ...response(listing([reception(2)])), headers: { get: k => k === 'X-Omachi-Preview' ? 'synthetic' : 'call,absent' } };
+  } });
+  await h.start(); await rowTrigger(rowItem(h)).emit('click');
+  assert.equal(h.el('row-menu-items').children.flatMap(x => x.children).length, 0);
+  assert.equal(h.posts().length, 0); h.controller.stop();
+});
+
+test('restoring the seat capability cannot revive an in-flight invalidated confirmation', async () => {
+  let lost = false; const gate = deferred();
+  const h = operationHarness({ seatLab: true, context: (_, n) => n === 2 ? gate.promise : undefined,
+    fetch: url => lost && url === '/staff/session'
+      ? { ...response(session()), headers: { get: () => null } } : undefined });
+  await h.start(); await h.open(); const confirming = h.confirm(); await settle();
+  lost = true; await h.controller.refresh();
+  lost = false; await h.controller.refresh();
+  gate.resolve(response({ metadata: metadata(), reception: reception() })); await confirming; await settle();
+  assert.equal(h.posts().length, 0); assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null);
+  h.controller.stop();
+});
