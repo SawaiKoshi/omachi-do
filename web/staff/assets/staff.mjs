@@ -136,12 +136,6 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
   function selectTab(view, { focus = false } = {}) {
     const sheet = SHEETS.find(item => item.key === view);
     if (!canBrowse() || !sheet) return false;
-    // An unsubmitted confirmation must be explicitly cancelled first. A sent
-    // or uncertain operation lives outside the sheets and survives navigation.
-    if (callUI?.isConfirming()) {
-      if (!get("call-confirmation").hidden) get("call-dismiss")?.focus();
-      return false;
-    }
     closeMenu(); closeDetail();
     const scroll = get("reception-scroll");
     if (scroll) scrollPositions[selectedTab] = scroll.scrollTop;
@@ -157,7 +151,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     menuEntry = entry;
     entry.trigger.setAttribute("aria-expanded", "true"); entry.item.dataset.menuOpen = "true";
     text("row-menu-title", `${numberText(entry.row.display_number)}のメニュー`);
-    text("row-menu-status", `現在状態：${LABELS[entry.row.status]}`);
+    text("row-menu-status", `現在状態：${LABELS[entry.row.status]} · 大人 ${entry.row.adults}名 · 子供 ${entry.row.children}名`);
     const actions = Array.isArray(entry.row.allowed_actions)
       ? [...new Set(entry.row.allowed_actions)].filter(action => typeof action === "string" && Object.hasOwn(ACTION_LABELS, action)) : [];
     const menuActions = enabledActions === "seat"
@@ -165,15 +159,18 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     get("row-menu-items").replaceChildren(...(menuActions.length ? menuActions.map(action => {
       const item = element("li");
       if (enabledActions?.split(",").includes(action) && callUI?.canStart(entry.row, action)) {
-        const button = element("button", `${ACTION_LABELS[action]}を確認`, "primary"); button.type = "button";
-        button.addEventListener("click", () => { closeMenu(); void callUI.prepare(entry.row, () => {
-          if (canBrowse() && rowNodes.get(entry.key) === entry) entry.trigger.focus();
-        }, action); });
+        const button = element("button", ACTION_LABELS[action], "primary"); button.type = "button";
+        button.setAttribute("aria-describedby", "row-menu-title row-menu-status row-menu-note");
+        button.addEventListener("click", () => {
+          if (rowNodes.get(entry.key) !== entry || entry.view !== selectedTab) return;
+          closeMenu(); entry.trigger.focus({ preventScroll: true });
+          void callUI.execute(entry.row, action);
+        });
         item.append(button);
       } else item.textContent = enabledActions === "seat" ? "案内完了（現在は実行不可）" : `${ACTION_LABELS[action]}（未接続・実行不可）`;
       return item;
     }) : [element("li", "この受付に利用可能な操作項目はありません。") ]));
-    text("row-menu-note", enabledActions ? `合成ラボ限定です。${LAB_LABELS[enabledActions]}は確認画面を経由します。`
+    text("row-menu-note", enabledActions === "seat" ? "お客様をご案内するタイミングで「案内完了」を押してください。" : enabledActions ? `合成ラボ限定です。${LAB_LABELS[enabledActions]}を選ぶと実行します。`
       : "閲覧専用プレビューです。ここから操作は実行できません。");
     hidden("row-menu", false); get("row-menu").focus();
     return true;
@@ -417,8 +414,8 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
     const background = canBrowse();
     abortReads({ preserveInteraction: background });
     const version = refreshVersion, authentication = authVersion;
-    const actions = env.location.port === "8446" ? "seat" : env.location.port === "8445" ? "call,absent" : "call";
-    const proof = { actions, verified: true };
+    const actions = { "8444": "call", "8445": "call,absent", "8446": "seat" }[env.location.port];
+    const proof = { actions, verified: Boolean(actions) };
     const current = () => started && !paused && !logoutPending && version === refreshVersion && authentication === authVersion;
     if (!background) {
       disabled("refresh-button", true);
@@ -484,7 +481,7 @@ export function createStaffApp({ document: doc, fetchImpl, window: env = globalT
           validRow, validMetadata, rowSignature, metadataSignature });
         callUI.update({ metadata: active.metadata, rows: [...active.rows, ...recent.rows] });
         text("staff-access-label", `共有認証・合成${mode.replace(",", "／")}限定`);
-        text("staff-list-help", `番号で詳細を表示 · 右スワイプ／「⋯」から${LAB_LABELS[mode]}を確認（合成データ限定）`);
+        text("staff-list-help", `番号で詳細を表示 · 右スワイプ／「⋯」から${LAB_LABELS[mode]}（合成データ限定）`);
         text("staff-footer", `開発用合成データ · ${LAB_LABELS[mode]}のみ`);
       } else {
         if (enabledActions) closeMenu();

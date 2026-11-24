@@ -22,7 +22,6 @@ const IDS = [
   'row-menu', 'row-menu-title', 'row-menu-status', 'row-menu-items', 'row-menu-close', 'synthetic-preview',
   'row-menu-note', 'staff-access-label', 'staff-list-help', 'staff-footer',
   'call-status-view', 'call-status-message', 'call-operation-id', 'call-lookup', 'call-retry',
-  'call-backdrop', 'call-confirmation', 'call-confirm-title', 'call-confirm-guidance', 'call-confirm-fields', 'call-dismiss', 'call-confirm',
   'update-status', 'call-success-view', 'call-success-message', 'call-success-close',
 ];
 
@@ -68,7 +67,7 @@ class Element extends Target {
     super();
     this.id = id;
     this.value = '';
-    this.hidden = ['staff-view', 'detail-view', 'row-menu', 'absent-panel', 'recent-panel', 'synthetic-preview', 'call-confirmation'].includes(id);
+    this.hidden = ['staff-view', 'detail-view', 'row-menu', 'absent-panel', 'recent-panel', 'synthetic-preview'].includes(id);
     this.disabled = false;
     this.dataset = {};
     this.attributes = new Map();
@@ -199,6 +198,7 @@ function harness({ fetch: fetchImpl, authenticated = true, rows = [], recent = [
     setTimeout(handler, delay) { timerId += 1; timers.set(timerId, { handler, at: time + delay }); return timerId; },
     clearTimeout(id) { timers.delete(id); },
   });
+  if (callLab) Object.assign(env.location, { port: '8444', origin: 'https://staff.localhost:8444' });
   if (operationLab) {
     const port = seatLab ? '8446' : '8445', origin = `https://staff.localhost:${port}`;
     Object.assign(env.location, { port, origin, href: origin + '/staff/' });
@@ -306,9 +306,10 @@ function callHarness(options = {}) {
   const h = harness({ ...options, rows, callLab: options.callLab ?? true, storage, fetch: async (url, request) => {
     if (url.endsWith('/operation-context')) {
       contexts += 1;
-      const override = await options.context?.(rows[0], contexts, url, request);
+      const row = rows.find(r => url === `/staff/receptions/${r.id}/operation-context`);
+      const override = await options.context?.(row, contexts, url, request);
       if (override !== undefined) return override;
-      return response({ metadata: metadata(options.meta), reception: { ...rows[0] } });
+      return response({ metadata: metadata(options.meta), reception: { ...row } });
     }
     if (url.includes('/staff/operations/')) {
       const override = await options.lookup?.(url, request);
@@ -327,9 +328,10 @@ function callHarness(options = {}) {
       const overridden = await options.post?.(body, request, rows, ledger);
       if (overridden !== undefined) return overridden;
       if (ledger.has(body.operation_id)) return response(ledger.get(body.operation_id));
-      rows[0] = { ...rows[0], status: 'called', revision: body.expected_revision + 1, called_at: '2026-11-01T18:10:00+09:00',
+      const index = rows.findIndex(r => url === `/staff/receptions/${r.id}/operations`);
+      rows[index] = { ...rows[index], status: 'called', revision: body.expected_revision + 1, called_at: '2026-11-01T18:10:00+09:00',
         allowed_actions: ['absent', 'seat', 'cancel'] };
-      const result = callReceipt(rows[0], body);
+      const result = callReceipt(rows[index], body);
       ledger.set(body.operation_id, result);
       return response(result);
     }
@@ -337,25 +339,25 @@ function callHarness(options = {}) {
   } });
   const postRequests = () => h.requests.filter(r => r.method === 'POST' && r.url.endsWith('/operations'));
   return { ...h, rows, storage, ledger, postRequests,
-    async openCall() {
+    async openCallMenu() {
       await h.el(rows[0].status === 'absent' ? 'absent-tab' : 'active-tab').emit('click');
       await rowTrigger(rowItem(h, 0, rows[0].status === 'absent' ? 'absent' : 'active')).emit('click');
       const button = h.el('row-menu-items').children.flatMap(item => item.children).find(item => item.tagName === 'BUTTON');
-      assert.ok(button, 'Synthetic call menu must contain one confirmation action');
-      await button.emit('click'); await settle();
+      assert.ok(button, 'Synthetic call menu must contain one direct action');
+      this.actionButton = button;
     },
-    async confirmCall() { await h.el('call-confirm').emit('click'); await settle(); await settle(); },
+    async chooseCall() { await this.actionButton?.emit('click'); await settle(); await settle(); },
   };
 }
 
 for (const status of ['waiting', 'absent']) {
-  test(`synthetic call ${status}->called requires two contexts and saves a fixed UUID before one POST`, async () => {
+  test(`synthetic call ${status}->called validates two contexts and saves a fixed UUID before one POST`, async () => {
     const h = callHarness({ row: { status } }); await h.start();
-    await h.openCall();
-    assert.equal(h.el('call-confirmation').hidden, false);
-    assert.match(h.el('call-confirm-fields').textContent, /20261101-001.*大人 2名.*子供 1名.*呼出/s);
+    await h.openCallMenu();
+    assert.equal(h.el('row-menu').hidden, false);
+    assert.match(h.el('row-menu-title').textContent, /001番/);
     assert.equal(h.postRequests().length, 0);
-    await h.confirmCall();
+    await h.chooseCall();
     assert.equal(h.postRequests().length, 1);
     assert.equal(h.rows[0].status, 'called');
     assert.equal(h.el('called-count').textContent, '1');
@@ -367,7 +369,7 @@ for (const status of ['waiting', 'absent']) {
 }
 
 test('confirmed success uses the reserved slot and expires after five seconds without changing rows, menus, scroll or journal', async () => {
-  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  const h = callHarness(); await h.start(); await h.openCallMenu(); await h.chooseCall();
   assert.equal(h.el('call-success-view').hidden, false);
   assert.equal(h.el('call-status-view').hidden, true);
   assert.equal(h.el('update-status').dataset.callNotice, 'true');
@@ -389,7 +391,7 @@ test('confirmed success uses the reserved slot and expires after five seconds wi
 });
 
 test('manual success dismissal only changes its display and returns keyboard focus to refresh', async () => {
-  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  const h = callHarness(); await h.start(); await h.openCallMenu(); await h.chooseCall();
   const stored = [...h.storage.values], row = rowItem(h), requests = h.requests.length;
   h.el('call-success-close').focus();
   await h.el('call-success-close').emit('click');
@@ -404,8 +406,8 @@ test('a delayed successful list refresh starts the success lifetime only after a
   const h = callHarness({ post: () => { delay = true; }, fetch: url => {
     if (delay && url.startsWith('/staff/receptions?') && new URL(url, 'https://staff.localhost').searchParams.get('view') === 'active') return pending.promise;
   } });
-  await h.start(); await h.openCall();
-  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.start(); await h.openCallMenu();
+  const sending = h.actionButton.emit('click'); await settle();
   await h.tick(5_000); assert.equal(h.el('call-success-view').hidden, true);
   delay = false; pending.resolve(response(listing(h.rows))); await sending; await settle(); await settle();
   assert.equal(h.el('call-success-view').hidden, false);
@@ -418,7 +420,7 @@ test('a successful receipt with failed latest-list refresh stays a persistent re
   const h = callHarness({ post: () => { offline = true; }, fetch: url => {
     if (offline && url.startsWith('/staff/receptions?')) throw new Error('list offline');
   } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   assert.equal(h.el('call-success-view').hidden, true);
   assert.match(h.el('call-status-message').textContent, /最新一覧を確認できません/);
   await h.tick(10_000);
@@ -435,7 +437,7 @@ test('a refreshed list from a different database cannot turn a historical receip
     const view = new URL(url, 'https://staff.localhost').searchParams.get('view');
     return response(listing(view === 'active' ? h.rows : [], view, { metadata: metadata({ database_id: nextDatabase }) }));
   } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   await h.tick(10_000);
   assert.equal(h.el('call-success-view').hidden, true);
   assert.equal(h.el('call-status-view').hidden, false);
@@ -449,7 +451,7 @@ for (const failure of ['unknown', 'conflict', 'current-context']) {
       if (failure === 'unknown') throw new Error('lost');
       if (failure === 'conflict') return response({ detail: 'conflict' }, 409);
     }, context: (_, count) => { if (failure === 'current-context' && count >= 3) throw new Error('context offline'); } });
-    await h.start(); await h.openCall(); await h.confirmCall();
+    await h.start(); await h.openCallMenu(); await h.chooseCall();
     const fixed = h.storage.getItem(CALL_JOURNAL_KEY);
     assert.ok(fixed);
     await h.tick(10_000);
@@ -462,15 +464,15 @@ for (const failure of ['unknown', 'conflict', 'current-context']) {
 test('an old success timer cannot erase the next success or a subsequent result-unknown panel', async () => {
   let attempts = 0;
   const h = callHarness({ post: () => { if (++attempts === 3) throw new Error('lost'); } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   const oldTimers = [...h.timers.values()].filter(timer => timer.at === h.env.now() + 5_000).map(timer => timer.handler);
   h.rows[0] = { ...h.rows[0], status: 'absent', revision: 2, allowed_actions: ['call', 'return', 'seat', 'cancel'] };
-  await h.controller.refresh(); await h.openCall(); await h.confirmCall();
+  await h.controller.refresh(); await h.openCallMenu(); await h.chooseCall();
   // Even callbacks already queued before cancellation must be harmless.
   assert.ok(oldTimers.length); oldTimers.forEach(handler => handler()); await settle();
   assert.equal(h.el('call-success-view').hidden, false);
   h.rows[0] = { ...h.rows[0], status: 'absent', revision: 4, allowed_actions: ['call', 'return', 'seat', 'cancel'] };
-  await h.controller.refresh(); await h.openCall(); await h.confirmCall();
+  await h.controller.refresh(); await h.openCallMenu(); await h.chooseCall();
   const fixed = h.storage.getItem(CALL_JOURNAL_KEY);
   oldTimers.forEach(handler => handler()); await h.tick(5_000);
   assert.equal(h.el('call-status-view').hidden, false); assert.match(h.el('call-status-message').textContent, /結果不明/);
@@ -478,7 +480,7 @@ test('an old success timer cannot erase the next success or a subsequent result-
 });
 
 test('focused or hovered success remains readable and gets five seconds after interaction ends', async () => {
-  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  const h = callHarness(); await h.start(); await h.openCallMenu(); await h.chooseCall();
   h.el('call-success-close').focus();
   await h.tick(6_000); assert.equal(h.el('call-success-view').hidden, false);
   h.el('refresh-button').focus(); await h.el('call-success-view').emit('focusout');
@@ -489,7 +491,7 @@ test('focused or hovered success remains readable and gets five seconds after in
 });
 
 test('logout clears success presentation and queued old timers cannot revive staff information after restart', async () => {
-  const h = callHarness(); await h.start(); await h.openCall(); await h.confirmCall();
+  const h = callHarness(); await h.start(); await h.openCallMenu(); await h.chooseCall();
   const timers = [...h.timers.values()].filter(timer => timer.at === h.env.now() + 5_000).map(timer => timer.handler);
   await h.controller.logout(); timers.forEach(handler => handler()); await settle();
   assertHidden(h); assert.equal(h.el('call-success-view').hidden, true);
@@ -499,22 +501,13 @@ test('logout clears success presentation and queued old timers cannot revive sta
   assert.equal(next.postRequests().length, 0); next.controller.stop();
 });
 
-test('confirmation dismissal and Escape send nothing and keyboard focus stays inside the confirmation', async () => {
-  const h = callHarness(); await h.start(); await h.openCall();
-  assert.equal(h.doc.activeElement, h.el('call-dismiss'));
-  assert.equal(h.el('call-backdrop').hidden, false);
-  await h.doc.emit('keydown', { key: 'Tab' });
-  assert.equal(h.doc.activeElement, h.el('call-confirm'));
-  await h.doc.emit('keydown', { key: 'Tab', shiftKey: true });
-  assert.equal(h.doc.activeElement, h.el('call-dismiss'));
-  await h.doc.emit('keydown', { key: 'Tab', shiftKey: true });
-  assert.equal(h.doc.activeElement, h.el('call-confirm'));
-  await h.doc.emit('keydown', { key: 'Escape' });
-  assert.equal(h.el('call-confirmation').hidden, true);
-  assert.equal(h.el('call-backdrop').hidden, true);
-  assert.equal(h.doc.activeElement, rowTrigger(rowItem(h)));
+test('opening and closing the call menu with Escape sends nothing and restores focus', async () => {
+  const h = callHarness(); await h.start(); await h.openCallMenu();
   assert.equal(h.postRequests().length, 0);
-  await h.openCall(); await h.el('call-dismiss').emit('click');
+  assert.equal(h.el('row-menu').hidden, false);
+  await h.doc.emit('keydown', { key: 'Escape' });
+  assert.equal(h.el('row-menu').hidden, true);
+  assert.equal(h.doc.activeElement, rowTrigger(rowItem(h)));
   assert.equal(h.postRequests().length, 0);
   h.controller.stop();
 });
@@ -529,60 +522,58 @@ test('cooperating tabs cannot hold two call locks and another tab only acquires 
   } };
   const first = callHarness({ lockManager }), second = callHarness({ lockManager });
   await first.start(); await second.start();
-  await first.openCall();
+  await first.openCallMenu();
   await rowTrigger(rowItem(second)).emit('click');
   assert.equal(second.el('row-menu-items').children.flatMap(item => item.children).length, 0);
   first.controller.stop(); await settle();
-  const third = callHarness({ lockManager }); await third.start(); await third.openCall();
-  assert.equal(third.el('call-confirmation').hidden, false);
+  const third = callHarness({ lockManager }); await third.start(); await third.openCallMenu();
+  assert.equal(third.actionButton.textContent, '呼出');
   second.controller.stop(); third.controller.stop();
 });
 
 for (const change of [ { status: 'called', revision: 1 }, { revision: 1 }, { adults: 3, total_people: 4 } ]) {
-  test(`changed target before confirmation is rejected: ${JSON.stringify(change)}`, async () => {
+  test(`changed target at operation start is rejected: ${JSON.stringify(change)}`, async () => {
     const h = callHarness({ context: row => response({ metadata: metadata(), reception: { ...row, ...change } }) });
-    await h.start(); await h.openCall();
-    assert.equal(h.el('call-confirmation').hidden, true);
+    await h.start(); await h.openCallMenu(); await h.chooseCall();
     assert.equal(h.postRequests().length, 0);
     h.controller.stop();
   });
 }
 
 for (const change of ['revision', 'write_epoch', 'database_id', 'status']) {
-  test(`final context ${change} change invalidates confirmation before UUID storage or POST`, async () => {
+  test(`final context ${change} change invalidates the selected operation before UUID storage or POST`, async () => {
     const h = callHarness({ context: (row, count) => count === 2 ? response({ metadata: metadata(
       ['write_epoch', 'database_id'].includes(change) ? { [change]: randomUUID() } : {}),
     reception: { ...row, ...(change === 'revision' ? { revision: 1 } : change === 'status' ? { status: 'called' } : {}) } }) : undefined });
-    await h.start(); await h.openCall(); await h.confirmCall();
+    await h.start(); await h.openCallMenu(); await h.chooseCall();
     assert.equal(h.postRequests().length, 0);
     assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
-    assert.equal(h.el('call-confirmation').hidden, true);
+
     h.controller.stop();
   });
 }
 
-test('background target changes invalidate an open confirmation while unchanged polling preserves it', async () => {
-  const h = callHarness(); await h.start(); await h.openCall();
-  const item = rowItem(h), fields = h.el('call-confirm-fields').children[0];
+test('background target changes invalidate an open menu while unchanged polling preserves it', async () => {
+  const h = callHarness(); await h.start(); await h.openCallMenu();
+  const item = rowItem(h);
   h.el('reception-scroll').scrollTop = 120;
   for (let i = 0; i < 25; i += 1) await h.controller.refresh();
   assert.equal(rowItem(h), item);
-  assert.equal(h.el('call-confirm-fields').children[0], fields);
   assert.equal(h.el('reception-scroll').scrollTop, 120);
-  assert.equal(h.el('call-confirmation').hidden, false);
+  assert.equal(h.el('row-menu').hidden, false);
   h.rows[0] = { ...h.rows[0], revision: 1 };
   await h.controller.refresh();
-  assert.equal(h.el('call-confirmation').hidden, true);
-  await h.confirmCall(); assert.equal(h.postRequests().length, 0);
+
+  await h.chooseCall(); assert.equal(h.postRequests().length, 0);
   h.controller.stop();
 });
 
-test('double confirm plus background five-second refresh creates one UUID and never aborts its POST', async () => {
+test('double action selection plus background five-second refresh creates one UUID and never aborts its POST', async () => {
   const pending = deferred(); let signal;
   const h = callHarness({ post: (body, request) => { signal = request.signal; return pending.promise; } });
-  await h.start(); await h.openCall();
-  const sending = h.el('call-confirm').emit('click'); await settle();
-  await h.el('call-confirm').emit('click');
+  await h.start(); await h.openCallMenu();
+  const sending = h.actionButton.emit('click'); await settle();
+  await h.actionButton.emit('click');
   await h.tick(5_000);
   assert.equal(h.postRequests().length, 1); assert.equal(signal.aborted, false);
   assert.match(h.el('call-status-message').textContent, /送信中/);
@@ -598,7 +589,7 @@ test('lost POST receipt is recovered by authenticated lookup and fresh context w
     ledger.set(body.operation_id, callReceipt(rows[0], body));
     throw new Error('response lost after commit');
   } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   assert.match(h.el('call-status-message').textContent, /結果不明/);
   assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
   await h.el('call-lookup').emit('click'); await settle(); await settle();
@@ -614,7 +605,7 @@ for (const status of [404, 503, 'network', 409]) {
       if (status === 'network') throw new Error('offline');
       return response({ detail: 'not a saved operation receipt' }, status);
     } });
-    await h.start(); await h.openCall(); await h.confirmCall();
+    await h.start(); await h.openCallMenu(); await h.chooseCall();
     const fixed = h.storage.getItem(CALL_JOURNAL_KEY);
     await h.el('call-lookup').emit('click'); await settle();
     assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), fixed);
@@ -628,7 +619,7 @@ for (const status of [404, 503, 'network', 409]) {
 test('explicit retry after unknown uses byte-identical body, UUID and expected revision', async () => {
   let attempt = 0;
   const h = callHarness({ post: () => { if (++attempt === 1) throw new Error('lost'); } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   await h.el('call-retry').emit('click'); await settle(); await settle();
   assert.equal(h.postRequests().length, 2);
   assert.equal(h.postRequests()[0].body, h.postRequests()[1].body);
@@ -661,7 +652,7 @@ for (const outcome of ['no_change', 'rejected']) {
 
 test('a generic POST409 is not a receipt and never changes revision for an automatic retry', async () => {
   const h = callHarness({ post: () => response({ detail: 'state conflict' }, 409) });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   const fixed = JSON.parse(h.storage.getItem(CALL_JOURNAL_KEY));
   assert.equal(fixed.request.expected_revision, 0);
   assert.match(h.el('call-status-message').textContent, /結果不明/);
@@ -674,7 +665,7 @@ test('reload/relogin restores one pending operation and looks up before allowing
     rows[0] = { ...rows[0], status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00' };
     ledger.set(body.operation_id, callReceipt(rows[0], body)); throw new Error('lost');
   } });
-  await first.start(); await first.openCall(); await first.confirmCall();
+  await first.start(); await first.openCallMenu(); await first.chooseCall();
   const fixed = storage.getItem(CALL_JOURNAL_KEY);
   await first.controller.logout();
   assert.equal(storage.getItem(CALL_JOURNAL_KEY), fixed);
@@ -694,7 +685,7 @@ for (const kind of ['unavailable', 'save-failure', 'corrupt', 'partial-missing']
     if (kind === 'partial-missing') storage.setItem('omachi.staff.call.guard.v1', 'pending:' + randomUUID());
     if (kind === 'unavailable') storage.fail = true;
     const h = callHarness({ storage }); await h.start();
-    if (kind === 'save-failure') { await h.openCall(); storage.fail = true; await h.confirmCall(); }
+    if (kind === 'save-failure') { await h.openCallMenu(); storage.fail = true; await h.chooseCall(); }
     else {
       await rowTrigger(rowItem(h)).emit('click');
       assert.equal(h.el('row-menu-items').children.flatMap(item => item.children).length, 0);
@@ -713,7 +704,7 @@ test('storage becoming unreadable after successful save/readback still stops the
     if (key === CALL_JOURNAL_KEY && raw && ++payloadReads === 2) storage.fail = true;
     return raw;
   };
-  const h = callHarness({ storage }); await h.start(); await h.openCall(); await h.confirmCall();
+  const h = callHarness({ storage }); await h.start(); await h.openCallMenu(); await h.chooseCall();
   assert.equal(h.postRequests().length, 0);
   assert.match(h.el('call-status-message').textContent, /確認|停止/);
   h.controller.stop();
@@ -766,8 +757,8 @@ for (const status of ['called', 'seated', 'cancelled']) {
 test('POST timeout stays unknown and its late successful response cannot overwrite the current UI', async () => {
   const pending = deferred(); let signal, fixed;
   const h = callHarness({ post: (body, request) => { fixed = body; signal = request.signal; return pending.promise; } });
-  await h.start(); await h.openCall();
-  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.start(); await h.openCallMenu();
+  const sending = h.actionButton.emit('click'); await settle();
   await h.tick(15_000); await sending; await settle();
   assert.equal(signal.aborted, true);
   assert.match(h.el('call-status-message').textContent, /結果不明/);
@@ -781,7 +772,7 @@ test('POST timeout stays unknown and its late successful response cannot overwri
 test('lookup in flight survives polling without starting another write or losing its ID', async () => {
   const pending = deferred(); let signal;
   const h = callHarness({ post: () => { throw new Error('lost'); }, lookup: (_, request) => { signal = request.signal; return pending.promise; } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   const checking = h.el('call-lookup').emit('click'); await settle();
   await h.tick(5_000);
   assert.equal(signal.aborted, false);
@@ -792,7 +783,7 @@ test('lookup in flight survives polling without starting another write or losing
 
 test('a received receipt with failed current-context lookup disables retry until safe lookup completes', async () => {
   const h = callHarness({ context: (_, count) => { if (count === 3) throw new Error('context offline'); } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   assert.match(h.el('call-status-message').textContent, /受領済み/);
   assert.equal(h.el('call-retry').hidden, true);
   assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
@@ -809,7 +800,7 @@ test('the current row comes from context/list reads, even when a historical rece
     rows[0] = { ...historical, status: 'absent', revision: 2, allowed_actions: ['call', 'return', 'seat', 'cancel'] };
     throw new Error('response lost');
   } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   await h.el('call-lookup').emit('click'); await settle(); await settle();
   assert.equal(h.el('absent-tab-count').textContent, '1');
   assert.equal(h.el('called-count').textContent, '0');
@@ -819,8 +810,8 @@ test('the current row comes from context/list reads, even when a historical rece
 test('logout during an in-flight POST hides details and retains journal despite a late response', async () => {
   const pending = deferred(); let body;
   const h = callHarness({ post: b => { body = b; return pending.promise; } });
-  await h.start(); await h.openCall();
-  const sending = h.el('call-confirm').emit('click'); await settle();
+  await h.start(); await h.openCallMenu();
+  const sending = h.actionButton.emit('click'); await settle();
   await h.controller.logout(); assertHidden(h);
   const record = h.storage.getItem(CALL_JOURNAL_KEY);
   assert.ok(record); assert.equal(h.el('call-status-view').hidden, true);
@@ -833,7 +824,7 @@ test('logout during an in-flight POST hides details and retains journal despite 
 for (const status of [401, 403]) {
   test(`operation auth ${status} closes information and retains unknown for authenticated recovery`, async () => {
     const h = callHarness({ post: () => response({ detail: 'auth failure' }, status) });
-    await h.start(); await h.openCall(); await h.confirmCall();
+    await h.start(); await h.openCallMenu(); await h.chooseCall();
     assertHidden(h); assert.ok(h.storage.getItem(CALL_JOURNAL_KEY));
     assert.ok(h.redirects.includes('/staff/login'));
     assert.equal(h.el('call-status-view').hidden, true); h.controller.stop();
@@ -845,7 +836,7 @@ test('background failure during explicit retry preflight prevents the retry POST
   const h = callHarness({ post: () => { throw new Error('lost'); },
     context: (_, count) => count === 3 ? pending.promise : undefined,
     fetch: url => { if (listFail && url.startsWith('/staff/receptions?')) throw new Error('list offline'); } });
-  await h.start(); await h.openCall(); await h.confirmCall();
+  await h.start(); await h.openCallMenu(); await h.chooseCall();
   const retrying = h.el('call-retry').emit('click'); await settle();
   listFail = true; await h.controller.refresh(); assertHidden(h);
   pending.resolve(response({ metadata: metadata(), reception: h.rows[0] })); await retrying; await settle();
@@ -1537,7 +1528,7 @@ test('a successful row update rejects old menu nodes and presents only the newer
   await swipe(h, oldItem);
   assert.equal(h.el('row-menu').hidden, true);
   await rowTrigger(rowItem(h)).emit('click', { detail: 0 });
-  assert.equal(h.el('row-menu-status').textContent, '現在状態：呼出中');
+  assert.equal(h.el('row-menu-status').textContent, '現在状態：呼出中 · 大人 2名 · 子供 1名');
   assert.match(h.el('row-menu-items').textContent, /不在/);
   assert.doesNotMatch(h.el('row-menu-items').textContent, /呼出（/);
   assertReadOnlyRequests(h.requests);
@@ -2396,10 +2387,11 @@ function operationHarness(options = {}) {
               valid_seating_event: seated.valid_seating_event, allowed_actions: [] };
             ledger.set(body.operation_id, { ...callReceipt(rows[index], body), action: 'seat', recorded_at: seated.seated_at });
           } else {
-            rows[0] = { ...rows[0], revision: body.expected_revision + 1, status: body.action === 'call' ? 'called' : 'absent',
-              called_at: body.action === 'call' ? '2026-11-01T18:10:00+09:00' : rows[0].called_at,
+            const index = rows.findIndex(r => url === `/staff/receptions/${r.id}/operations`);
+            rows[index] = { ...rows[index], revision: body.expected_revision + 1, status: body.action === 'call' ? 'called' : 'absent',
+              called_at: body.action === 'call' ? '2026-11-01T18:10:00+09:00' : rows[index].called_at,
               allowed_actions: body.action === 'call' ? ['absent', 'seat', 'cancel'] : ['call', 'return', 'seat', 'cancel'] };
-            ledger.set(body.operation_id, { ...callReceipt(rows[0], body), action: body.action });
+            ledger.set(body.operation_id, { ...callReceipt(rows[index], body), action: body.action });
           }
         }
         return response(ledger.get(body.operation_id));
@@ -2411,20 +2403,21 @@ function operationHarness(options = {}) {
     if (override === undefined && options.seatLab && url.startsWith('/staff/receptions?')) {
       const view = new URL(url, 'https://staff.localhost:8446').searchParams.get('view');
       const visible = rows.filter(r => view === 'active' ? ['waiting', 'called', 'absent'].includes(r.status) : r.status === 'seated');
+      if (view === 'recently_seated') visible.sort((a, b) => b.valid_seating_event.event_id - a.valid_seating_event.event_id);
       return response(listing(visible, view));
     }
     return override;
   } });
   const posts = () => h.requests.filter(r => r.method === 'POST' && r.url.endsWith('/operations'));
   return { ...h, rows, storage, ledger, posts,
-    async open(action = options.seatLab ? 'seat' : 'call', index = 0) {
+    async openMenu(action = options.seatLab ? 'seat' : 'call', index = 0) {
       const view = rows[index].status === 'absent' ? 'absent' : 'active';
       await h.el(`${view}-tab`).emit('click');
       await rowTrigger(rowItem(h, index, view)).emit('click');
-      const button = h.el('row-menu-items').children.flatMap(item => item.children).find(item => item.textContent === `${action === 'seat' ? '案内完了' : action === 'call' ? '呼出' : '不在'}を確認`);
-      assert.ok(button, `Expected ${action} confirmation item`); await button.emit('click'); await settle();
+      const button = h.el('row-menu-items').children.flatMap(item => item.children).find(item => item.textContent === (action === 'seat' ? '案内完了' : action === 'call' ? '呼出' : '不在'));
+      assert.ok(button, `Expected ${action} action item`); this.actionButton = button;
     },
-    async confirm() { await h.el('call-confirm').emit('click'); await settle(); await settle(); },
+    async chooseAction() { await this.actionButton?.emit('click'); await settle(); await settle(); },
   };
 }
 
@@ -2433,15 +2426,13 @@ test('8445 waiting→called→absent→called uses one shared journal and preser
   const original = { ...h.rows[0] };
   for (const [action, status, word] of [['call', 'called', '呼出'], ['absent', 'absent', '不在'], ['call', 'called', '呼出']]) {
     const previous = h.posts().length;
-    await h.open(action);
+    await h.openMenu(action);
     const selectedSheet = h.rows[0].status === 'absent' ? 'absent' : 'active';
     assert.equal(h.posts().length, previous);
-    assert.equal(h.el('call-confirmation').hidden, false);
-    assert.match(h.el('call-confirm-fields').textContent, /20261101-001.*受付日時.*大人 2名.*子供 1名/s);
-    assert.match(h.el('call-confirm-title').textContent, new RegExp(word));
-    assert.equal(h.doc.activeElement, h.el('call-dismiss'));
+    assert.equal(h.el('row-menu').hidden, false);
+    assert.equal(h.actionButton.textContent, word);
     const called = h.rows[0].called_at;
-    await h.confirm();
+    await h.chooseAction();
     assert.equal(h.rows[0].status, status);
     assert.equal(h.el(`${selectedSheet}-tab`).getAttribute('aria-selected'), 'true', 'writes cannot switch the selected sheet');
     const targetSheet = status === 'absent' ? 'absent' : 'active';
@@ -2464,8 +2455,8 @@ test('8445 waiting→called→absent→called uses one shared journal and preser
 for (const [action, status] of [['call', 'waiting'], ['absent', 'called']]) {
   test(`8445 ${action} double-click sends once and its confirmed toast expires without changing rows/focus/scroll`, async () => {
     const h = operationHarness({ row: { status, called_at: status === 'called' ? '2026-11-01T18:05:00+09:00' : null,
-      allowed_actions: [action] } }); await h.start(); await h.open(action);
-    await Promise.all([h.confirm(), h.confirm()]);
+      allowed_actions: [action] } }); await h.start(); await h.openMenu(action);
+    await Promise.all([h.chooseAction(), h.chooseAction()]);
     assert.equal(h.posts().length, 1);
     const view = action === 'absent' ? 'absent' : 'active';
     await h.el(`${view}-tab`).emit('click');
@@ -2480,7 +2471,7 @@ for (const [action, status] of [['call', 'waiting'], ['absent', 'called']]) {
 }
 
 for (const change of ['status', 'revision', 'write_epoch', 'database_id', 'allowed_actions']) {
-  test(`8445 final context ${change} change invalidates confirmation before any POST`, async () => {
+  test(`8445 final context ${change} change invalidates the selected operation before any POST`, async () => {
     const h = operationHarness({ context: (row, n) => {
       if (n !== 2) return;
       const value = { reception: { ...row }, metadata: metadata() };
@@ -2490,26 +2481,26 @@ for (const change of ['status', 'revision', 'write_epoch', 'database_id', 'allow
       if (['database_id', 'write_epoch'].includes(change)) value.metadata[change] = randomUUID();
       return response(value);
     } });
-    await h.start(); await h.open(); await h.confirm();
-    assert.equal(h.posts().length, 0); assert.equal(h.el('call-confirmation').hidden, true);
+    await h.start(); await h.openMenu(); await h.chooseAction();
+    assert.equal(h.posts().length, 0);
     assert.match(h.el('call-status-message').textContent, /確認|選び直/); h.controller.stop();
   });
 }
 
-test('8445 changed source before menu context never opens a confirmation or sends', async () => {
+test('8445 changed source at the first context prevents sending', async () => {
   const h = operationHarness({ context: row => response({ metadata: metadata(), reception: { ...row, status: 'called',
     revision: 1, called_at: '2026-11-01T18:10:00+09:00', allowed_actions: ['absent'] } }) });
-  await h.start(); await h.open(); assert.equal(h.el('call-confirmation').hidden, true);
+  await h.start(); await h.openMenu(); await h.chooseAction();
   assert.equal(h.posts().length, 0); h.controller.stop();
 });
 
-test('8445 confirmation and focus survive unchanged polling, but changing the target closes it', async () => {
-  const h = operationHarness(); await h.start(); await h.open();
-  const fields = h.el('call-confirm-fields').children[0], focus = h.doc.activeElement;
+test('8445 menu and focus survive unchanged polling, but changing the target closes it', async () => {
+  const h = operationHarness(); await h.start(); await h.openMenu();
+  const focus = h.doc.activeElement;
   for (let i = 0; i < 25; i++) await h.tick(5000);
-  assert.equal(h.el('call-confirm-fields').children[0], fields); assert.equal(h.doc.activeElement, focus);
+  assert.equal(h.doc.activeElement, focus);
   h.rows[0] = { ...h.rows[0], revision: 1 }; await h.controller.refresh();
-  assert.equal(h.el('call-confirmation').hidden, true); await h.confirm(); assert.equal(h.posts().length, 0); h.controller.stop();
+  await h.chooseAction(); assert.equal(h.posts().length, 0); h.controller.stop();
 });
 
 for (const action of ['call', 'absent']) {
@@ -2518,7 +2509,7 @@ for (const action of ['call', 'absent']) {
     const h = operationHarness({ row: action === 'absent' ? { status: 'called', called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent'] } : {},
       post: (_, __, ___, ____, apply) => { if (first) { first = false; apply(); throw Error('synthetic response loss'); } },
       lookup: () => missing ? response({}, 404) : undefined });
-    await h.start(); await h.open(action); await h.confirm();
+    await h.start(); await h.openMenu(action); await h.chooseAction();
     assert.match(h.el('call-status-message').textContent, /結果不明/);
     const saved = h.storage.getItem(OPERATION_JOURNAL_KEY), body = h.posts()[0].body;
     await h.el('call-lookup').emit('click');
@@ -2542,7 +2533,7 @@ for (const seatLab of [false, true]) test(`${seatLab ? 8446 : 8445} persisted re
       outcome: 'rejected', response_status: 409, error: { code: 'revision_conflict', detail: 'synthetic conflict' } };
     ledger.set(body.operation_id, receipt); return response(receipt, 409);
   } });
-  await h.start(); await h.open(); await h.confirm();
+  await h.start(); await h.openMenu(); await h.chooseAction();
   assert.equal(h.rows[0].status, 'waiting'); assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null);
   assert.match(h.el('call-status-message').textContent, /拒否・競合/);
   await h.tick(10001); assert.equal(h.el('call-status-view').hidden, false); assert.equal(h.el('call-success-view').hidden, true);
@@ -2553,7 +2544,7 @@ test('8445 result success without a verified latest list never becomes an expiri
   let fail = false;
   const h = operationHarness({ post: (_, __, ___, ____, apply) => { const result = apply(); fail = true; return result; },
     fetch: url => fail && url.startsWith('/staff/receptions?') ? response({}, 503) : undefined });
-  await h.start(); await h.open(); await h.confirm();
+  await h.start(); await h.openMenu(); await h.chooseAction();
   assertHidden(h); assert.equal(h.el('call-success-view').hidden, true);
   assert.match(h.el('call-status-message').textContent, /最新一覧.*未確認/);
   await h.tick(10001); assert.equal(h.el('call-status-view').hidden, false);
@@ -2561,15 +2552,15 @@ test('8445 result success without a verified latest list never becomes an expiri
 });
 
 for (const denial of [401, 403]) {
-  test(`8445 ${denial} on background session closes confirmation/detail/receipts and ignores a late POST 200`, async () => {
+  test(`8445 ${denial} on background session closes menu/detail/receipts and ignores a late POST 200`, async () => {
     let expired = false; const gate = deferred();
     const h = operationHarness({ post: (_, __, ___, ____, apply) => { const result = apply(); gate.result = result; return gate.promise; },
       fetch: url => url === '/staff/session' && expired ? response({}, denial) : undefined });
-    await h.start(); await h.open(); const sending = h.confirm(); await settle();
+    await h.start(); await h.openMenu(); const sending = h.chooseAction(); await settle();
     assert.equal(h.posts().length, 1); const saved = h.storage.getItem(OPERATION_JOURNAL_KEY);
     expired = true; await h.controller.refresh();
-    assertHidden(h); assert.equal(h.el('call-confirm-fields').textContent, '');
-    assert.equal(h.el('call-confirmation').hidden, true); assert.equal(h.el('call-status-message').textContent, '');
+    assertHidden(h);
+    assert.equal(h.el('call-status-message').textContent, '');
     gate.resolve(gate.result); await sending; await settle();
     assertHidden(h); assert.equal(h.el('call-success-view').hidden, true);
     assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), saved); assert.equal(h.posts().length, 1);
@@ -2577,14 +2568,14 @@ for (const denial of [401, 403]) {
   });
   for (const seatLab of [false, true]) test(`${seatLab ? 8446 : 8445} ${denial} from operation context closes UI before a new POST`, async () => {
     const h = operationHarness({ seatLab, context: (_, n) => n === 2 ? response({}, denial) : undefined });
-    await h.start(); await h.open(); await h.confirm(); assertHidden(h);
-    assert.equal(h.el('call-confirm-fields').textContent, ''); assert.equal(h.posts().length, 0); h.controller.stop();
+    await h.start(); await h.openMenu(); await h.chooseAction(); assertHidden(h);
+    assert.equal(h.posts().length, 0); h.controller.stop();
   });
 }
 
 test('8445 reload/relogin queries the existing ID and current context without a new POST', async () => {
   const first = operationHarness({ post: (_, __, ___, ____, apply) => { apply(); throw Error('lost'); } });
-  await first.start(); await first.open(); await first.confirm();
+  await first.start(); await first.openMenu(); await first.chooseAction();
   const saved = JSON.parse(first.storage.getItem(OPERATION_JOURNAL_KEY)); first.controller.stop(); await settle();
   const next = operationHarness({ rows: first.rows, storage: first.storage, ledger: first.ledger }); await next.start(); await settle(); await settle();
   assert.ok(next.requests.some(r => r.url === `/staff/operations/${saved.operation_id}`));
@@ -2602,7 +2593,7 @@ for (const manual of [false, true]) {
       ledger: new Map([[id, callReceipt(row, request)]]) });
     await h.start(); await settle(); await settle();
     assert.equal(h.posts().length, 0); assert.equal(storage.getItem(CALL_JOURNAL_KEY), null);
-    await h.open('absent'); assert.equal(h.el('call-confirmation').hidden, false); h.controller.stop();
+    await h.openMenu('absent'); assert.equal(h.actionButton.textContent, '不在'); h.controller.stop();
   });
 }
 
@@ -2657,7 +2648,7 @@ test('8445 shared lock prevents a call tab and absent tab from independently sta
   } };
   const first = operationHarness({ lockManager }), second = operationHarness({ lockManager,
     row: { status: 'called', called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent'] } });
-  await first.start(); await second.start(); await first.open();
+  await first.start(); await second.start(); await first.openMenu();
   await rowTrigger(rowItem(second)).emit('click');
   assert.equal(second.el('row-menu-items').children.flatMap(x => x.children).length, 0);
   assert.equal(second.posts().length, 0); first.controller.stop(); second.controller.stop();
@@ -2666,7 +2657,7 @@ test('8445 shared lock prevents a call tab and absent tab from independently sta
 test('8445 unknown POST survives background refresh without abort, extra UUID, or a second pending action', async () => {
   const gate = deferred(); let postSignal;
   const h = operationHarness({ post: (_, request, __, ___, apply) => { gate.result = apply(); postSignal = request.signal; return gate.promise; } });
-  await h.start(); await h.open(); const sending = h.confirm(); await settle();
+  await h.start(); await h.openMenu(); const sending = h.chooseAction(); await settle();
   const saved = h.storage.getItem(OPERATION_JOURNAL_KEY);
   for (let i = 0; i < 2; i++) await h.tick(5000);
   assert.equal(postSignal.aborted, false); assert.equal(h.posts().length, 1);
@@ -2677,7 +2668,7 @@ test('8445 unknown POST survives background refresh without abort, extra UUID, o
 
 test('8445 timeout keeps the fixed request and never auto-hides or auto-reposts', async () => {
   const h = operationHarness({ post: () => new Promise(() => {}) });
-  await h.start(); await h.open(); const sending = h.confirm(); await settle();
+  await h.start(); await h.openMenu(); const sending = h.chooseAction(); await settle();
   const saved = h.storage.getItem(OPERATION_JOURNAL_KEY);
   await h.tick(15001); await sending;
   assert.match(h.el('call-status-message').textContent, /結果不明/); assert.equal(h.posts().length, 1);
@@ -2714,20 +2705,20 @@ for (const kind of ['corrupt', 'save-failure', 'missing-guard']) {
     if (kind === 'corrupt') storage.setItem(OPERATION_JOURNAL_KEY, '{');
     if (kind === 'missing-guard') storage.setItem('omachi.staff.operation.guard.v2', `pending:${randomUUID()}`);
     const h = operationHarness({ storage }); await h.start();
-    if (kind === 'save-failure') { await h.open(); storage.fail = true; await h.confirm(); }
+    if (kind === 'save-failure') { await h.openMenu(); storage.fail = true; await h.chooseAction(); }
     else { await rowTrigger(rowItem(h)).emit('click'); assert.equal(h.el('row-menu-items').children.flatMap(x => x.children).length, 0); }
     assert.equal(h.posts().length, 0); assert.match(h.el('call-status-message').textContent, /復旧情報|停止/); h.controller.stop();
   });
 }
 
-test('8445 keyboard cancel, focus trap, and success timer generations do not mutate the journal', async () => {
-  const h = operationHarness(); await h.start(); await h.open();
-  await h.doc.emit('keydown', { key: 'Tab' }); assert.equal(h.doc.activeElement, h.el('call-confirm'));
-  await h.doc.emit('keydown', { key: 'Escape' }); assert.equal(h.el('call-confirmation').hidden, true);
+test('8445 menu Escape restores focus and success timer generations do not mutate the journal', async () => {
+  const h = operationHarness(); await h.start(); await h.openMenu();
+  await h.doc.emit('keydown', { key: 'Escape' });
+  assert.equal(h.el('row-menu').hidden, true); assert.equal(h.doc.activeElement, rowTrigger(rowItem(h)));
   assert.equal(h.posts().length, 0);
-  await h.open(); await h.confirm();
+  await h.openMenu(); await h.chooseAction();
   const firstTimer = [...h.timers.values()].find(timer => timer.at === h.env.now() + 5000)?.handler;
-  await h.open('absent'); await h.confirm();
+  await h.openMenu('absent'); await h.chooseAction();
   firstTimer?.(); assert.equal(h.el('call-success-view').hidden, false);
   h.el('call-success-close').focus(); await h.tick(6000); assert.equal(h.el('call-success-view').hidden, false);
   await h.el('call-success-close').emit('click'); assert.equal(h.el('call-success-view').hidden, true);
@@ -2738,24 +2729,24 @@ for (const closing of ['logout', 'expiry']) {
   test(`8445 ${closing} closes UI, keeps a pending request and discards its late response`, async () => {
     const gate = deferred();
     const h = operationHarness({ post: (_, __, ___, ____, apply) => { gate.result = apply(); return gate.promise; } });
-    await h.start(); await h.open(); const sending = h.confirm(); await settle();
+    await h.start(); await h.openMenu(); const sending = h.chooseAction(); await settle();
     const saved = h.storage.getItem(OPERATION_JOURNAL_KEY);
     if (closing === 'logout') await h.controller.logout();
     else { h.doc.visibilityState = 'hidden'; await h.doc.emit('visibilitychange'); await h.tick(900001); }
     assertHidden(h); gate.resolve(gate.result); await sending; await settle(); await settle();
-    assert.equal(h.el('call-success-view').hidden, true); assert.equal(h.el('call-confirm-fields').textContent, '');
+    assert.equal(h.el('call-success-view').hidden, true);
     assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), saved); assert.equal(h.posts().length, 1); h.controller.stop();
   });
 }
 
-test('8445 background capability loss invalidates a confirmation and cannot enable a different journal', async () => {
+test('8445 background capability loss closes the action menu and cannot enable a different journal', async () => {
   let lost = false;
   const h = operationHarness({ fetch: url => {
     if (!lost || url !== '/staff/session') return;
     return { ...response(session()), headers: { get: k => k === 'X-Omachi-Preview' ? 'synthetic' : 'call' } };
   } });
-  await h.start(); await h.open(); lost = true; await h.controller.refresh();
-  assert.equal(h.el('call-confirmation').hidden, true); await h.confirm();
+  await h.start(); await h.openMenu(); lost = true; await h.controller.refresh();
+  await h.chooseAction();
   assert.equal(h.posts().length, 0); assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null); h.controller.stop();
 });
 
@@ -2771,7 +2762,7 @@ test('8445 a newer background row invalidates an older final-context response be
     if (n === 1) prepared = { ...row };
     if (n === 2) return gate.promise;
   } });
-  await h.start(); await h.open(); const confirming = h.confirm(); await settle();
+  await h.start(); await h.openMenu(); const confirming = h.chooseAction(); await settle();
   h.rows[0] = { ...h.rows[0], status: 'called', revision: 1, called_at: '2026-11-01T18:10:00+09:00', allowed_actions: ['absent'] };
   await h.controller.refresh();
   gate.resolve(response({ metadata: metadata(), reception: prepared })); await confirming; await settle(); await settle();
@@ -2907,29 +2898,24 @@ test('a changed row staying in the same sheet restores its focused control witho
 });
 
 for (const [port, factory] of [[8444, callHarness], [8445, operationHarness]]) {
-  test(`${port} an unsubmitted confirmation blocks click, keyboard and direct sheet navigation until explicit cancellation`, async () => {
+  test(`${port} opening a menu permits keyboard tab changes without a POST`, async () => {
     const h = factory(); await h.start();
-    await (port === 8444 ? h.openCall() : h.open());
-    await h.el('absent-tab').emit('click');
+    await (port === 8444 ? h.openCallMenu() : h.openMenu());
     await h.el('active-tab').emit('keydown', { key: 'End' });
-    assert.equal(h.controller.selectTab('recently_seated'), false);
-    assert.equal(h.el('active-tab').getAttribute('aria-selected'), 'true');
-    assert.equal(h.el('call-confirmation').hidden, false); assert.equal(h.doc.activeElement, h.el('call-dismiss'));
-    assert.equal(h.requests.filter(r => r.method === 'POST').length, 0);
-    await h.el('call-dismiss').emit('click'); await h.el('absent-tab').emit('click');
-    assert.equal(h.el('absent-panel').hidden, false);
+    assert.equal(h.el('recent-tab').getAttribute('aria-selected'), 'true');
     assert.equal(h.requests.filter(r => r.method === 'POST').length, 0); h.controller.stop();
   });
-  test(`${port} delayed initial context cannot open confirmation on a different sheet`, async () => {
+  test(`${port} a selected operation survives tab navigation while initial context is delayed`, async () => {
     const gate = deferred();
     const h = factory({ context: (_row, count) => count === 1 ? gate.promise : undefined }); await h.start();
-    await (port === 8444 ? h.openCall() : h.open());
+    await (port === 8444 ? h.openCallMenu() : h.openMenu());
+    const sending = port === 8444 ? h.chooseCall() : h.chooseAction(); await settle();
     await h.el('absent-tab').emit('click');
-    assert.equal(h.el('active-tab').getAttribute('aria-selected'), 'true');
-    gate.resolve(response({ metadata: metadata(), reception: reception() })); await settle(); await settle();
-    assert.equal(h.el('call-confirmation').hidden, false);
-    assert.equal(h.el('active-tab').getAttribute('aria-selected'), 'true');
-    assert.equal(h.requests.filter(r => r.method === 'POST').length, 0); h.controller.stop();
+    assert.equal(h.el('absent-tab').getAttribute('aria-selected'), 'true');
+    gate.resolve(response({ metadata: metadata(), reception: reception() })); await sending; await settle(); await settle();
+
+    assert.equal(h.el('absent-tab').getAttribute('aria-selected'), 'true');
+    assert.equal(h.requests.filter(r => r.method === 'POST').length, 1); h.controller.stop();
   });
 }
 
@@ -2939,7 +2925,7 @@ for (const action of ['call', 'absent']) {
     const h = operationHarness({ row: action === 'absent' ? { status: 'called', called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent'] } : {},
       post: (_body, request, _rows, _ledger, apply) => { gate.result = apply(); gate.signal = request.signal; return gate.promise; },
       lookup: () => missing ? response({}, 404) : undefined });
-    await h.start(); await h.open(action); const sending = h.confirm(); await settle();
+    await h.start(); await h.openMenu(action); const sending = h.chooseAction(); await settle();
     const saved = h.storage.getItem(OPERATION_JOURNAL_KEY);
     assert.ok(saved);
     for (const prefix of ['absent', 'recent', 'active']) {
@@ -2999,7 +2985,7 @@ for (const failure of [401, 403, 409, 'network']) {
 }
 
 for (const status of ['waiting', 'called']) {
-  test(`8446 confirms, cancels and seats the selected ${status} reception once`, async () => {
+  test(`8446 directly seats the selected ${status} reception once`, async () => {
     const target = reception(2, { status, called_at: status === 'called' ? '2026-11-01T18:05:00+09:00' : null,
       allowed_actions: ['call', 'absent', 'seat'] });
     const gate = deferred();
@@ -3008,17 +2994,12 @@ for (const status of ['waiting', 'called']) {
     } });
     await h.start();
     await rowTrigger(rowItem(h, 1)).emit('click');
-    assert.deepEqual(h.el('row-menu-items').children.flatMap(x => x.children.map(b => b.textContent)), ['案内完了を確認']);
-    await h.open('seat', 1);
-    assert.match(h.el('call-confirm-fields').textContent, /20261101-002.*大人 2名.*子供 1名/s);
-    assert.equal(h.el('call-confirm-guidance').textContent, 'お客様をご案内するタイミングで確定してください');
-    assert.ok(h.el('call-confirm-fields').textContent.includes(status === 'waiting' ? '待機中' : '呼出中'));
-    assert.equal(h.doc.activeElement, h.el('call-dismiss'));
-    await h.el('call-dismiss').emit('click');
+    assert.deepEqual(h.el('row-menu-items').children.flatMap(x => x.children.map(b => b.textContent)), ['案内完了']);
+    await h.openMenu('seat', 1);
+    assert.match(h.el('row-menu-title').textContent, /002番/);
+    assert.ok(h.el('row-menu-status').textContent.includes(status === 'waiting' ? '待機中' : '呼出中'));
     assert.equal(h.posts().length, 0);
-    assert.equal(h.doc.activeElement, rowTrigger(rowItem(h, 1)));
-    await h.open('seat', 1);
-    await Promise.all([h.confirm(), h.confirm()]);
+    await Promise.all([h.chooseAction(), h.chooseAction()]);
     assert.equal(h.posts().length, 1);
     assert.equal(h.posts()[0].url, `/staff/receptions/${target.id}/operations`);
     assert.equal(h.el('unseated-count').textContent, '2');
@@ -3050,7 +3031,7 @@ test('8446 does not offer seat on absent or seated rows even with an extra allow
 
 test('8446 recovers the lost seat result by ID after login, with no second POST', async () => {
   const first = operationHarness({ seatLab: true, post: (_, __, ___, ____, apply) => { apply(); throw Error('lost'); } });
-  await first.start(); await first.open(); await first.confirm();
+  await first.start(); await first.openMenu(); await first.chooseAction();
   assert.match(first.el('call-status-message').textContent, /結果不明/);
   const saved = JSON.parse(first.storage.getItem(OPERATION_JOURNAL_KEY));
   await rowTrigger(rowItem(first)).emit('click');
@@ -3064,15 +3045,15 @@ test('8446 recovers the lost seat result by ID after login, with no second POST'
   assert.equal(next.el('unseated-count').textContent, '0'); next.controller.stop();
 });
 
-test('8446 mismatched session capability closes confirmation before a delayed list completes', async () => {
+test('8446 mismatched session capability closes the menu before a delayed list completes', async () => {
   let lost = false; const gate = deferred();
   const h = operationHarness({ seatLab: true, fetch: async url => {
     if (lost && url === '/staff/session') return { ...response(session()), headers: { get: k => k === 'X-Omachi-Preview' ? 'synthetic' : 'call' } };
     if (lost && url.startsWith('/staff/receptions?')) await gate.promise;
   } });
-  await h.start(); await h.open(); lost = true; const poll = h.controller.refresh(); await settle();
-  assert.equal(h.el('call-confirmation').hidden, true);
-  await h.confirm(); assert.equal(h.posts().length, 0);
+  await h.start(); await h.openMenu(); lost = true; const poll = h.controller.refresh(); await settle();
+
+  await h.chooseAction(); assert.equal(h.posts().length, 0);
   gate.resolve(); await poll; await rowTrigger(rowItem(h)).emit('click');
   assert.equal(h.el('row-menu-items').children.flatMap(x => x.children).length, 0);
   h.controller.stop();
@@ -3101,15 +3082,98 @@ test('8446 requires seat on every page of both lists', async () => {
   assert.equal(h.posts().length, 0); h.controller.stop();
 });
 
-test('restoring the seat capability cannot revive an in-flight invalidated confirmation', async () => {
+test('restoring the seat capability cannot revive an in-flight invalidated selection', async () => {
   let lost = false; const gate = deferred();
   const h = operationHarness({ seatLab: true, context: (_, n) => n === 2 ? gate.promise : undefined,
     fetch: url => lost && url === '/staff/session'
       ? { ...response(session()), headers: { get: () => null } } : undefined });
-  await h.start(); await h.open(); const confirming = h.confirm(); await settle();
+  await h.start(); await h.openMenu(); const confirming = h.chooseAction(); await settle();
   lost = true; await h.controller.refresh();
   lost = false; await h.controller.refresh();
   gate.resolve(response({ metadata: metadata(), reception: reception() })); await confirming; await settle();
   assert.equal(h.posts().length, 0); assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null);
+  h.controller.stop();
+});
+
+for (const [port, action, factory] of [
+  [8444, 'call', callHarness], [8445, 'call', operationHarness],
+  [8445, 'absent', operationHarness], [8446, 'seat', options => operationHarness({ ...options, seatLab: true })],
+]) {
+  test(`${port} ${action}: swipe/menu send nothing; one explicit selection validates twice and consecutive rows work`, async () => {
+    const initial = action === 'absent' ? { status: 'called', called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent'] } : {};
+    const h = factory({ rows: [reception(1, initial), reception(2, initial)] });
+    await h.start();
+    const posts = () => h.requests.filter(r => r.method === 'POST' && r.url.endsWith('/operations'));
+    const label = { call: '呼出', absent: '不在', seat: '案内完了' }[action];
+    h.el('reception-scroll').scrollTop = 135;
+    for (let i = 0; i < 2; i++) {
+      const item = rowItem(h, action === 'call' ? i : 0), id = item.dataset.receptionId;
+      await swipe(h, item);
+      assert.equal(posts().length, i);
+      assert.equal(h.el('row-menu').hidden, false);
+      const buttons = h.el('row-menu-items').children.flatMap(x => x.children);
+      const button = buttons.find(b => b.textContent === label);
+      assert.ok(button);
+      assert.equal(button.getAttribute('aria-describedby'), 'row-menu-title row-menu-status row-menu-note');
+      assert.match(h.el('row-menu-status').textContent, /大人 2名.*子供 1名/);
+      button.focus();
+      await Promise.all([button.emit('click'), button.emit('click'), button.emit('click')]);
+      await settle(); await settle();
+      assert.equal(posts().length, i + 1);
+      assert.equal(posts()[i].url, `/staff/receptions/${id}/operations`);
+      assert.equal(JSON.parse(posts()[i].body).action, action);
+      assert.ok(h.requests.filter(r => r.url === `/staff/receptions/${id}/operation-context`).length >= 3);
+      assert.equal(h.el('active-tab').getAttribute('aria-selected'), 'true');
+      assert.equal(h.el('reception-scroll').scrollTop, 135);
+      assert.match(h.el('call-success-message').textContent, /成功.*最新一覧/);
+      if (action === 'seat') assert.equal(h.doc.activeElement, h.el('active-tab'));
+      else if (action === 'absent') {
+        assert.equal(h.doc.activeElement, h.el('active-tab'));
+        await h.el('active-tab').emit('click');
+      } else assert.equal(h.doc.activeElement, rowTrigger(rowItem(h, i)));
+    }
+    assert.equal(new Set(posts().map(p => JSON.parse(p.body).operation_id)).size, 2);
+    h.controller.stop();
+  });
+
+  for (const change of ['removed', 'revision', 'state', 'auth']) {
+    test(`${port} ${action}: a ${change} change during the second context prevents UUID and POST`, async () => {
+      const gate = deferred(); let selected;
+      const h = factory({ row: action === 'absent' ? { status: 'called', called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent'] } : {},
+        context: (row, n) => {
+          if (n === 1) selected = { ...row };
+          return n === 2 ? gate.promise : undefined;
+        } });
+      let issued = 0; h.env.crypto.randomUUID = () => { issued++; return randomUUID(); };
+      await h.start();
+      if (port === 8444) await h.openCallMenu(); else await h.openMenu(action);
+      const request = port === 8444 ? h.chooseCall() : h.chooseAction(); await settle();
+      if (change === 'auth') await h.controller.logout();
+      else {
+        if (change === 'removed') h.rows.splice(0, 1);
+        else h.rows[0] = { ...h.rows[0], revision: h.rows[0].revision + 1,
+          ...(change === 'state' ? { status: 'absent', called_at: '2026-11-01T18:05:00+09:00' } : {}) };
+        await h.controller.refresh();
+      }
+      gate.resolve(response({ metadata: metadata(), reception: selected })); await request; await settle();
+      assert.equal(issued, 0);
+      assert.equal(h.requests.filter(r => r.method === 'POST' && r.url.endsWith('/operations')).length, 0);
+      h.controller.stop();
+    });
+  }
+}
+
+test('8444 a restored capability does not revive the earlier selected call', async () => {
+  let lost = false; const gate = deferred();
+  const h = callHarness({ context: (_, n) => n === 2 ? gate.promise : undefined,
+    fetch: url => lost && url === '/staff/session'
+      ? { ...response(session()), headers: { get: () => null } } : undefined });
+  await h.start(); await h.openCallMenu(); const pending = h.chooseCall(); await settle();
+  lost = true; await h.controller.refresh();
+  lost = false; await h.controller.refresh();
+  gate.resolve(response({ metadata: metadata(), reception: reception() })); await pending; await settle();
+  assert.equal(h.postRequests().length, 0);
+  assert.equal(h.storage.getItem(CALL_JOURNAL_KEY), null);
+  assert.match(h.el('call-status-message').textContent, /変わりました|選び直/);
   h.controller.stop();
 });
