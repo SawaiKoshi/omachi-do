@@ -3,7 +3,6 @@
 import { createStaffOperations } from './staff-operations.mjs';
 import { canApplyOperation, operationLabMetadata } from './staff-operation-contract.mjs';
 
-const LABELS = { waiting: '待機中', called: '呼出中', absent: '不在', seated: '案内済み', cancelled: '取消済み' };
 const ACTIONS = { call: '呼出', absent: '不在', seat: '案内完了' };
 
 export function createStaffOperationUI({ document: doc, window: env, fetchImpl, now, seatOnly = false, security,
@@ -12,8 +11,8 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
   const text = (id, value) => { if (get(id) && get(id).textContent !== value) get(id).textContent = value; };
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const disable = (id, value) => { if (get(id)) get(id).disabled = value; };
-  let alive = true, snapshot = null, ticket = null, returnFocus = null, confirmationVersion = 0;
-  let busy = false, preparing = false, message = '', phase = 'idle', recoveredVersion = null, settled = null;
+  let alive = true, snapshot = null, operationVersion = 0;
+  let busy = false, message = '', phase = 'idle', recoveredVersion = null, settled = null;
   let submission = null;
   let successTimer = null, successVersion = 0, successVisible = false, hovered = false;
   const active = () => alive && security().active;
@@ -21,14 +20,14 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     && rowSignature(a.reception) === rowSignature(b.reception);
   function submissionCurrent() {
     if (!submission) return true;
-    if (submission.version !== confirmationVersion) return false;
+    if (submission.version !== operationVersion) return false;
     const row = snapshot?.rows.find(r => r.id === submission.context.reception.id);
     return Boolean(row && same(submission.context, { reception: row, metadata: snapshot.metadata }));
   }
   const engine = createStaffOperations({ window: env, fetchImpl, now, seatOnly, security: () => {
     const auth = security();
     // Keep the foundation's final pre-UUID readiness check false when a
-    // newer background snapshot invalidated an in-flight confirmation.
+    // newer background snapshot invalidated the selected operation.
     return { ...auth, ready: auth.ready && submissionCurrent() };
   }, authFailure: () => {
     closeDisplay();
@@ -56,8 +55,7 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     scheduleSuccess();
   }
   function invalidate(value = '') {
-    confirmationVersion++; ticket = null; returnFocus = null;
-    get('call-confirm-fields')?.replaceChildren(); hide('call-confirmation', true); hide('call-backdrop', true);
+    operationVersion++;
     if (value) { message = value; phase = 'conflict'; }
   }
   function closeDisplay() {
@@ -68,7 +66,7 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
   function canStart(row, action = 'call') {
     const state = engine.status();
     return Boolean(active() && security().ready && snapshot && operationLabMetadata(snapshot.metadata)
-      && !busy && !preparing && !state.authExpired && !state.busy && state.lockState === 'owned'
+      && !busy && !state.authExpired && !state.busy && state.lockState === 'owned'
       && state.journal.kind === 'empty' && canApplyOperation(action, row));
   }
   function render() {
@@ -82,43 +80,10 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     else if (!value && state.lockState !== 'owned') value = '別タブで利用中、または安全なタブ間排他が利用できないため、このタブでは操作できません。';
     text('call-status-message', value); hide('call-status-view', !value && !pending);
     text('call-operation-id', pending ? `操作ID：${state.journal.record.operation_id}` : '');
-    hide('call-lookup', !pending); disable('call-lookup', busy || preparing);
+    hide('call-lookup', !pending); disable('call-lookup', busy);
     hide('call-retry', state.journal.kind !== 'pending' || state.journal.source !== 'v2' || state.receipt !== null);
-    disable('call-retry', busy || preparing || !security().ready || state.lockState !== 'owned');
-    disable('call-confirm', busy || preparing || !ticket?.context || !security().ready);
-    hide('call-confirmation', !ticket); hide('call-backdrop', !ticket);
+    disable('call-retry', busy || !security().ready || state.lockState !== 'owned');
     if (get('call-status-view')) get('call-status-view').dataset.phase = phase;
-  }
-  async function prepare(row, restoreFocus, action = 'call') {
-    if (!canStart(row, action)) return false;
-    clearSuccess(); invalidate(); preparing = true; phase = 'confirming'; message = `${ACTIONS[action]}対象の最新情報を確認しています。`; render();
-    const version = confirmationVersion, auth = security().version;
-    const original = { reception: row, metadata: snapshot.metadata };
-    try {
-      const selected = await engine.prepare(action, row.id);
-      if (!current(auth) || version !== confirmationVersion) return false;
-      const latest = selected?.context, visible = snapshot?.rows.find(r => r.id === row.id);
-      if (!latest || !visible || !same(original, latest)
-          || !same(latest, { reception: visible, metadata: snapshot.metadata })) {
-        invalidate('受付情報が変わったか確認できません。最新の一覧から選び直してください。'); return false;
-      }
-      ticket = selected; returnFocus = restoreFocus;
-      const fields = doc.createElement('dl'); fields.className = 'detail-fields';
-      const add = (label, value) => {
-        const dt = doc.createElement('dt'), dd = doc.createElement('dd');
-        dt.textContent = label; dd.textContent = value; fields.append(dt, dd);
-      };
-      const r = latest.reception;
-      add('受付番号（日付付き）', r.display_number);
-      add('受付日時', new Date(r.received_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }));
-      add('人数', `大人 ${r.adults}名 · 子供 ${r.children}名`); add('現在状態', LABELS[r.status]); add('実行する操作', ACTIONS[action]);
-      get('call-confirm-fields').replaceChildren(fields);
-      if (action === 'seat') text('call-confirm-guidance', 'お客様をご案内するタイミングで確定してください');
-      text('call-confirm-title', `${ACTIONS[action]}の確認（合成データ限定）`); text('call-confirm', `${ACTIONS[action]}を確定`);
-      message = `${ACTIONS[action]}確認中です。内容を確認して確定してください。`;
-      hide('call-confirmation', false); get('call-dismiss')?.focus();
-      return true;
-    } finally { preparing = false; render(); }
   }
   function verifiedList(value) {
     if (!snapshot || !security().ready || metadataSignature(snapshot.metadata) !== metadataSignature(value.current.metadata)) return false;
@@ -136,22 +101,37 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
     }
     return true;
   }
-  async function run(method) {
+  async function run(method, row, action) {
     const before = engine.status();
-    if (!active() || before.authExpired || busy || preparing || method === 'confirm' && !ticket) return false;
-    const selected = ticket, auth = security().version;
-    const context = method === 'confirm' ? selected.context : null;
-    const focusRow = selected?.action === 'seat' && get('call-confirmation')?.contains(doc.activeElement) ? returnFocus : null;
+    if (!active() || before.authExpired || busy || method === 'execute' && !canStart(row, action)) { render(); return false; }
+    const auth = security().version;
+    const original = method === 'execute' ? { reception: row, metadata: snapshot.metadata } : null;
     recoveredVersion = auth;
     busy = true; clearSuccess(); settled = null;
     phase = method === 'lookup' ? 'checking' : 'sending';
     message = method === 'lookup' ? '保存された操作結果と現在状態を照会しています。'
-      : '最新状態を確認・送信中です。結果が確定するまで新しい操作はできません。';
+      : method === 'execute' ? `${row.display_number}の${ACTIONS[action]}を処理中です。結果が確定するまで新しい操作はできません。`
+        : '固定要求を送信中です。結果が確定するまで新しい操作はできません。';
     invalidate();
-    submission = context ? { context, version: confirmationVersion } : null;
-    render(); focusRow?.();
+    submission = original ? { context: original, version: operationVersion } : null;
+    const version = operationVersion;
+    render();
     try {
-      const result = await engine[method](...(method === 'confirm' ? [selected] : []));
+      let result;
+      if (method === 'execute') {
+        const selected = await engine.prepare(action, row.id);
+        const latest = selected?.context;
+        if (!current(auth)) return false;
+        if (version !== operationVersion) {
+          phase = 'conflict'; message = '操作条件が変わりました。最新の一覧から選び直してください。';
+          return false;
+        }
+        if (!latest || !same(original, latest) || !submissionCurrent()) {
+          phase = 'conflict'; message = '受付情報が変わったか確認できません。最新の一覧から選び直してください。';
+          return false;
+        }
+        result = await engine.confirm(selected);
+      } else result = await engine[method]();
       if (!current(auth)) return false;
       const state = engine.status();
       if (!result) {
@@ -174,54 +154,35 @@ export function createStaffOperationUI({ document: doc, window: env, fetchImpl, 
   }
   function update(next) {
     snapshot = next;
-    if (ticket) {
-      const context = ticket.context, row = context && next.rows.find(r => r.id === context.reception.id);
-      if (!row || !same(context, { reception: row, metadata: next.metadata })) invalidate('確認中の受付情報が変わりました。選び直してください。');
-    }
     if (!busy && settled) finishList();
     render();
     const state = engine.status(), version = security().version;
     // Reinitialization never POSTs. Only the stored ID is queried once after
     // an authenticated all-page snapshot; an explicit button can query again.
     if (active() && !state.authExpired && ['pending', 'manual'].includes(state.journal.kind)
-        && recoveredVersion !== version && !busy && !preparing) { recoveredVersion = version; void run('lookup'); }
+        && recoveredVersion !== version && !busy) { recoveredVersion = version; void run('lookup'); }
   }
   function suspend() {
     snapshot = null; invalidate(); clearSuccess();
     if (settled && settled.receipt.outcome !== 'rejected') { phase = 'review'; message = '操作結果は確定していますが、最新一覧は未確認です。再送せず最新情報を取得してください。'; }
     render();
   }
-  function dismiss() {
-    const restore = returnFocus; invalidate(); message = ''; phase = 'idle'; render(); if (active()) restore?.();
-  }
   function dismissSuccess() {
     const focused = doc.activeElement === get('call-success-close'); clearSuccess();
     if (focused && active()) get('refresh-button')?.focus();
   }
-  const handlers = { 'call-confirm': () => { void run('confirm'); }, 'call-dismiss': dismiss,
-    'call-lookup': () => { void run('lookup'); }, 'call-retry': () => { void run('retry'); }, 'call-success-close': dismissSuccess };
+  const handlers = { 'call-lookup': () => { void run('lookup'); }, 'call-retry': () => { void run('retry'); }, 'call-success-close': dismissSuccess };
   const pauseSuccess = () => { successVersion++; env.clearTimeout(successTimer); successTimer = null; };
   const successHandlers = { focusin: pauseSuccess, focusout: () => { void Promise.resolve().then(scheduleSuccess); },
     pointerenter: () => { hovered = true; pauseSuccess(); }, pointerleave: () => { hovered = false; scheduleSuccess(); } };
-  const keyDown = event => {
-    if (!ticket) return;
-    if (event.key === 'Escape') { event.preventDefault(); dismiss(); }
-    if (event.key === 'Tab') {
-      event.preventDefault(); const cancel = get('call-dismiss'), confirm = get('call-confirm');
-      (confirm.disabled ? cancel : doc.activeElement === cancel ? confirm : doc.activeElement === confirm ? cancel : event.shiftKey ? confirm : cancel)?.focus();
-    }
-  };
   for (const [id, handler] of Object.entries(handlers)) get(id)?.addEventListener('click', handler);
   for (const [type, handler] of Object.entries(successHandlers)) get('call-success-view')?.addEventListener(type, handler);
-  doc.addEventListener('keydown', keyDown);
-  return { canStart, prepare, update, suspend, clearSuccess,
-    isConfirming: () => preparing || ticket !== null,
+  return { canStart, execute: (row, action) => run('execute', row, action), update, suspend, clearSuccess,
     expireAuthentication() { engine.expireAuthentication(); closeDisplay(); },
     stop() {
       alive = false; engine.stop(); closeDisplay();
       for (const [id, handler] of Object.entries(handlers)) get(id)?.removeEventListener('click', handler);
       for (const [type, handler] of Object.entries(successHandlers)) get('call-success-view')?.removeEventListener(type, handler);
-      doc.removeEventListener('keydown', keyDown);
     },
   };
 }

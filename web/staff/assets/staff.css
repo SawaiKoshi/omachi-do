@@ -105,10 +105,7 @@ body[data-staff-page="receptions"] .row-party { white-space: nowrap; font-size: 
 .call-status { flex: 0 0 auto; max-height: min(30dvh, 210px); overflow: auto; padding: 8px 12px; border: 2px solid #b88b31; border-radius: 8px; background: #fff5d8; }
 .call-status p { margin: 0; }
 .call-status small { display: block; overflow-wrap: anywhere; }
-.call-recovery-actions, .call-confirm-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
-.call-backdrop { position: fixed; z-index: 9; inset: 0; background: #18343d66; }
-.call-confirmation { position: fixed; z-index: 10; inset: 50% auto auto 50%; transform: translate(-50%, -50%); width: min(640px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; border: 3px solid var(--accent); box-shadow: 0 8px 32px #18343d38; }
-body[data-staff-page="receptions"] .call-confirm-actions button { min-height: 56px; min-width: 160px; }
+.call-recovery-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
 body[data-staff-page="receptions"] .detail-panel { position: absolute; z-index: 4; inset: 4px; overflow: auto; padding: 16px; box-shadow: 0 8px 32px #18343d38; }
 body[data-staff-page="receptions"] footer { padding: 3px 12px; flex: 0 0 auto; font-size: .7rem; }
 @media (max-width: 900px) {

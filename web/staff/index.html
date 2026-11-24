@@ -74,22 +74,12 @@
         <div id="detail-content"></div>
       </section>
     </div>
-    <section id="call-status-view" class="call-status" role="status" aria-live="polite" hidden>
+    <section id="call-status-view" class="call-status" role="status" aria-live="polite" aria-atomic="true" hidden>
       <p id="call-status-message"></p>
       <small id="call-operation-id"></small>
       <div class="call-recovery-actions">
         <button id="call-lookup" type="button" class="secondary" hidden>同じ操作IDの結果を照会</button>
         <button id="call-retry" type="button" class="secondary" hidden>同じID・同じ内容で再送</button>
-      </div>
-    </section>
-    <div id="call-backdrop" class="call-backdrop" aria-hidden="true" hidden></div>
-    <section id="call-confirmation" class="call-confirmation panel" role="dialog" aria-modal="true" aria-labelledby="call-confirm-title" aria-describedby="call-confirm-guidance" hidden>
-      <h2 id="call-confirm-title">呼出の確認（合成データ限定）</h2>
-      <p id="call-confirm-guidance">対象を確認してください。確定直前にも最新状態を確認します。</p>
-      <div id="call-confirm-fields"></div>
-      <div class="call-confirm-actions">
-        <button id="call-dismiss" type="button" class="secondary">キャンセル</button>
-        <button id="call-confirm" type="button" class="primary" disabled>呼出を確定</button>
       </div>
     </section>
     <noscript><p class="message">認証を確認できないため受付情報を表示しません。JavaScriptを有効にしてください。</p></noscript>

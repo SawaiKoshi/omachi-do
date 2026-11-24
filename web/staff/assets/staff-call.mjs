@@ -8,7 +8,6 @@ const stamp = value => typeof value === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/.tes
 const keys = (value, names) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).sort().join(',') === [...names].sort().join(',');
 const RECEIPT_KEYS = ['operation_id', 'reception_id', 'action', 'outcome', 'response_status', 'recorded_at', 'resulting_revision', 'reception', 'error'];
-const LABELS = { waiting: '待機中', called: '呼出中', absent: '不在', seated: '案内済み', cancelled: '取消済み' };
 
 export const callLabResponse = response => response.headers?.get('X-Omachi-Preview') === 'synthetic'
   && response.headers?.get('X-Omachi-Preview-Actions') === 'call';
@@ -59,8 +58,8 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
   const text = (id, value) => { if (get(id)?.textContent !== value) get(id).textContent = value; };
   const hide = (id, value) => { if (get(id)) get(id).hidden = value; };
   const disable = (id, value) => { if (get(id)) get(id).disabled = value; };
-  let alive = true, snapshot = null, confirmation = null, confirmationVersion = 0, returnFocus = null;
-  let busy = false, preparing = false, received = null, recoveredAuth = null;
+  let alive = true, snapshot = null, confirmation = null, confirmationVersion = 0;
+  let busy = false, preparing = false, executing = false, received = null, recoveredAuth = null;
   let phase = 'idle', notice = '', lockState = 'checking', releaseLock;
   // Presentation only: never read, resolve or remove a journal from this timer.
   let successTimer = null, successVersion = 0, successVisible = false, successHovered = false;
@@ -97,7 +96,7 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
   }
 
   function render() {
-    if (!active()) { hide('call-status-view', true); hide('call-confirmation', true); hide('call-backdrop', true); return; }
+    if (!active()) { hide('call-status-view', true); return; }
     const pending = state();
     const isPending = ['pending', 'manual'].includes(pending.kind);
     let message = notice;
@@ -111,17 +110,12 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
     hide('call-lookup', !isPending); disable('call-lookup', busy);
     hide('call-retry', pending.kind !== 'pending' || received !== null);
     disable('call-retry', busy || lockState !== 'owned' || !snapshot);
-    disable('call-confirm', busy || preparing || !confirmation);
-    hide('call-confirmation', !confirmation);
-    hide('call-backdrop', !confirmation);
     if (get('call-status-view')) get('call-status-view').dataset.phase = phase;
   }
 
   function invalidate(message = '') {
     clearSuccess();
     confirmationVersion += 1; confirmation = null; preparing = false;
-    returnFocus = null;
-    hide('call-confirmation', true); get('call-confirm-fields')?.replaceChildren();
     if (message && state().kind === 'empty') { notice = message; phase = 'conflict'; }
     render();
   }
@@ -145,8 +139,8 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
         method, headers, ...(body === undefined ? {} : { body }), signal: controller.signal,
         credentials: 'same-origin', mode: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer',
       }), timeout]);
-      if (!callLabResponse(response)) throw new Error('environment');
       if ([401, 403].includes(response.status)) throw new Error('auth');
+      if (!callLabResponse(response)) throw new Error('environment');
       const value = await Promise.race([response.json(), timeout]);
       return { status: response.status, value };
     } finally { env.clearTimeout(timer); }
@@ -165,9 +159,9 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
     return metadataSignature(a.metadata) === metadataSignature(b.metadata) && rowSignature(a.reception) === rowSignature(b.reception);
   }
 
-  async function prepare(row, restoreFocus) {
+  async function prepare(row) {
     if (!canStart(row)) return false;
-    invalidate(); preparing = true; phase = 'confirming'; notice = '呼出対象の最新情報を確認しています。'; render();
+    invalidate(); preparing = true; phase = 'checking'; notice = `${row.display_number}の呼出対象を確認しています。`; render();
     const version = confirmationVersion, auth = security().version;
     const original = { reception: row, metadata: snapshot.metadata };
     try {
@@ -177,18 +171,7 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
       if (!matches(original, latest) || !visible || !matches(latest, { reception: visible, metadata: snapshot.metadata })
           || !['waiting', 'absent'].includes(latest.reception.status)
           || !latest.reception.allowed_actions.includes('call') || lockState !== 'owned') throw new Error('changed');
-      confirmation = latest; returnFocus = restoreFocus; notice = '呼出確認中です。内容を確認して「呼出を確定」を押してください。';
-      const fields = doc.createElement('dl'); fields.className = 'detail-fields';
-      const add = (label, value) => {
-        const dt = doc.createElement('dt'), dd = doc.createElement('dd');
-        dt.textContent = label; dd.textContent = value; fields.append(dt, dd);
-      };
-      const r = latest.reception;
-      add('受付番号（日付付き）', r.display_number);
-      add('受付日時', new Date(r.received_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }));
-      add('人数', `大人 ${r.adults}名 · 子供 ${r.children}名`); add('現在状態', LABELS[r.status]); add('実行する操作', '呼出');
-      get('call-confirm-fields').replaceChildren(fields);
-      hide('call-confirmation', false); get('call-dismiss')?.focus();
+      confirmation = latest;
       return true;
     } catch (error) {
       if (active() && version === confirmationVersion && auth === security().version) {
@@ -263,7 +246,9 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
     try {
       const latest = await context(selected.reception.id);
       if (!currentResponse(auth) || version !== confirmationVersion) return false;
-      if (!matches(selected, latest) || lockState !== 'owned') throw new Error('changed');
+      const visible = snapshot?.rows.find(row => row.id === selected.reception.id);
+      if (!matches(selected, latest) || !visible || !matches(latest, { reception: visible, metadata: snapshot.metadata })
+          || !security().ready || lockState !== 'owned') throw new Error('changed');
       const operation_id = env.crypto.randomUUID();
       const record = journal.begin({ operation_id, reception_id: selected.reception.id, database_id: latest.metadata.database_id,
         request: { operation_id, action: 'call', expected_revision: latest.reception.revision, write_epoch: latest.metadata.write_epoch } });
@@ -337,7 +322,6 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
   }
 
   function suspend() { snapshot = null; invalidate(); render(); }
-  function dismiss() { const restore = returnFocus; invalidate(); if (active()) restore?.(); }
   function dismissSuccess() {
     const focused = doc.activeElement === get('call-success-close');
     clearSuccess();
@@ -347,23 +331,10 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
   const successBlur = () => { void Promise.resolve().then(scheduleSuccess); };
   const successEnter = () => { successHovered = true; successFocus(); };
   const successLeave = () => { successHovered = false; scheduleSuccess(); };
-  const handlers = { 'call-confirm': () => { void confirm(); }, 'call-dismiss': dismiss,
-    'call-lookup': () => { void lookup(); }, 'call-retry': () => { void retry(); }, 'call-success-close': dismissSuccess };
+  const handlers = { 'call-lookup': () => { void lookup(); }, 'call-retry': () => { void retry(); }, 'call-success-close': dismissSuccess };
   for (const [id, handler] of Object.entries(handlers)) get(id)?.addEventListener('click', handler);
   const successHandlers = { focusin: successFocus, focusout: successBlur, pointerenter: successEnter, pointerleave: successLeave };
   for (const [type, handler] of Object.entries(successHandlers)) get('call-success-view')?.addEventListener(type, handler);
-  const escape = event => {
-    if (!confirmation) return;
-    if (event.key === 'Escape') { event.preventDefault(); dismiss(); }
-    if (event.key === 'Tab') {
-      event.preventDefault();
-      const dismissButton = get('call-dismiss'), confirmButton = get('call-confirm');
-      const target = confirmButton.disabled ? dismissButton : doc.activeElement === dismissButton ? confirmButton
-        : doc.activeElement === confirmButton ? dismissButton : event.shiftKey ? confirmButton : dismissButton;
-      target?.focus();
-    }
-  };
-  doc.addEventListener('keydown', escape);
   try {
     if (!env.navigator?.locks?.request) throw new Error('locks');
     void env.navigator.locks.request('omachi.synthetic.staff.call.v1', { mode: 'exclusive', ifAvailable: true }, async lock => {
@@ -373,13 +344,26 @@ export function createStaffCall({ document: doc, window: env, fetchImpl, now, se
     }).catch(() => { lockState = 'unavailable'; render(); });
   } catch { lockState = 'unavailable'; }
 
-  return { prepare, confirm, lookup, retry, canStart, update, suspend, clearSuccess,
-    isConfirming: () => preparing || confirmation !== null,
+  async function execute(row) {
+    if (executing || !canStart(row)) { render(); return false; }
+    executing = true;
+    try {
+      if (!await prepare(row)) return false;
+      return await confirm();
+    } finally {
+      executing = false;
+      if (active() && state().kind === 'empty' && phase === 'checking') {
+        phase = 'conflict'; notice = '操作条件が変わりました。最新の一覧から選び直してください。';
+      }
+      render();
+    }
+  }
+
+  return { execute, canStart: row => !executing && canStart(row), update, suspend, clearSuccess,
     stop() {
       alive = false; invalidate(); releaseLock?.();
       for (const [id, handler] of Object.entries(handlers)) get(id)?.removeEventListener('click', handler);
       for (const [type, handler] of Object.entries(successHandlers)) get('call-success-view')?.removeEventListener(type, handler);
-      doc.removeEventListener('keydown', escape);
     },
   };
 }
