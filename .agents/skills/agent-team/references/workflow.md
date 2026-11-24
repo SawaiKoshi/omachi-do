@@ -64,7 +64,7 @@ gh issue list --label agent:ready --state open --json number,title,labels,body -
 
 ## 6. 実装用モデルへ切り替え
 
-同じ子スレッドのまま、`profile.md` の「実装」の行のモデル・推論の強さに切り替える。プロバイダーをまたぐ切り替え（Claude→Codex）はしない。T3 Code が「プロバイダーの切り替えは文脈が欠ける」としているため。Codex を使う作業は `delegate_task` で別の子スレッドとして起動する。
+同じ子スレッドのまま、`profile.md` の「実装」の行の推論の強さに切り替える。モデル自体（Opus など）は変えない。モデルを変えるとそれまでの会話のキャッシュが使えず、会話全体を読み直すことになるため。プロバイダーをまたぐ切り替え（Claude→Codex）はしない。T3 Code が「プロバイダーの切り替えは文脈が欠ける」としているため。Codex を使う作業は `delegate_task` で別の子スレッドとして起動する。
 
 ## 7. 実装（子スレッド）
 
@@ -110,6 +110,7 @@ gh pr view <PR> --json number,state,isDraft,headRefName,headRefOid,body,statusCh
 ```
 ## #<N> 準備完了：PR #<PR>（SHA <短縮SHA>）
 ゲート：成功（<実行したコマンド>）
+品質の記録：ゲート初回 成功／失敗、修正の往復 <n>回、レビュー blocker <n>・major <n>、差し戻し <n>回
 未確認：<実機・本番など、確かめていないこと>
 マージしたときの影響：<例：koshi-town は main へのマージで公開サイトに反映される>
 → マージ・レビュアー指定などはご判断ください
@@ -129,4 +130,4 @@ gh pr view <PR> --json number,state,isDraft,headRefName,headRefOid,body,statusCh
 
 ## 定期実行（任意）
 
-T3 Code のスケジュール機能で「`/agent-team` 手順1〜4だけ実行し、承認シートを作って止まる」を平日朝などに登録できる。手順5以降は必ずユーザーの返事を待つ。
+T3 Code のスケジュール機能で「`/agent-team` 手順1〜4だけ実行し、承認シートを作って止まる」を平日朝などに登録できる。手順5以降は必ずユーザーの返事を待つ。最初に `agent:ready` の件数だけを確かめ、0件ならすぐ終わる（空回りで使用量を減らさない）。

@@ -24,6 +24,7 @@
 |------|------|
 | `.agents/skills/agent-team/` | 統括のスキル（手順・依頼文・品質確認） |
 | `.agents/skills/team-plan/` `team-implement/` `team-review/` | 子スレッドのスキル |
+| `.agents/skills/token-budget/` | 精度を落とさずに使用量を減らす決まりと、週1回の点検手順 |
 | `.claude/skills/*/SKILL.md` | Claude Code 用の入口（本体は `.agents/skills/`） |
 | `.agents/team/profile.md` | このリポジトリの役割・モデル・承認が要る場所・例外ケース |
 | `.agents/team/gate.sh` | PR 前に必ず通す検証 |
@@ -53,7 +54,8 @@
    止まらなかったら、T3 Code の Claude Code がプロジェクトの `.claude/settings.json` を読んでいない可能性があります。統括に進む前に教えてください。ガード自体の自己テストは `python3 .agents/team/hooks/selftest.py` です。
 4. **Codex のレビュー用設定**：レビュー役の Codex は、サンドボックスを read-only にして使います（Claude 用の安全ガードは Codex には効かないため、Codex 側はサンドボックスと承認設定で守ります）。
 5. **最初のタスク**：小さくて失敗しても困らないもの（文言の修正、テストの追加など）を Issue テンプレートで作り、`agent:ready` を付けます。T3 Code でこのリポジトリの新しいスレッドを Claude（Opus）で開き、`/agent-team` と送ります。
-6. 慣れてきたら、同時に2タスクまで並べる。T3 Code のスケジュール機能で「手順1〜4だけ実行して承認シートを作る」を朝に回すこともできます。
+6. **使用量を週1回点検する**：`token-budget` スキルの「使用量の点検」に沿って、Claude Code の `/usage`（`w` で7日分）と Codex の `/status` を見ます。モデルや推論の強さを下げるのは、同スキルの「下げる前に測る」で同等と確かめた役割だけにします。
+7. 慣れてきたら、同時に2タスクまで並べる。T3 Code のスケジュール機能で「手順1〜4だけ実行して承認シートを作る」を朝に回すこともできます。
 
 ## 安全ガードが止めるもの
 

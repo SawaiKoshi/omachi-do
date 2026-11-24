@@ -12,6 +12,8 @@ description: AIチームのレビュー役（主にCodex）。draft PRを読む�
 - 指摘ごとに、確かめた事実（file:line、コマンドの結果）と推測を分ける。推測だけの指摘は重大度を1段下げ、「推測」と書く。
 - 秘密情報（`.env`、キー、トークン、環境変数の値）を読まない・表示しない。
 
+- 読み方は `.agents/skills/token-budget/SKILL.md` の「読む量を絞る」に従う。ただし差分と、変えた箇所の呼び出し元は省略せずに読む。
+
 ## 手順
 
 1. 対象を確かめる：`git branch --show-current`、`git rev-parse HEAD` が依頼のSHAと一致するか。違えばそのことを報告する。
