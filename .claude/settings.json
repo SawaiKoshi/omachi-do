@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I \"$CLAUDE_PROJECT_DIR/.agents/team/hooks/guard.py\"",
-            "timeout": 10
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.agents/team/hooks/run-guard.sh\" || exit 2",
+            "timeout": 15
           }
         ]
       }

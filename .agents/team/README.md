@@ -36,8 +36,9 @@
 
 ## ここから始める
 
-1. **T3 Code を最新にする**：エージェントがスレッドを作れる「T3 Code MCP」と `delegate_task` は v0.1.0（Orchestrator V2）以降の機能です。T3 Code の設定で、Claude Code から T3 Code MCP に接続します（接続方法は T3 Code のドキュメントに従ってください）。接続しなくても「手動モード」で使えます。
-2. **ラベルを作る**（リポジトリごとに1回、ご自身で実行）：
+1. **T3 Code でプロジェクトを開く場所を確かめる**：AIチームは、そのリポジトリの最新のフォルダーで動かします。WSL の中にあるフォルダー（例：`~/projects/omachi-do`）は、T3 Code の **WSL 環境** で開きます（設定の「Sharing & access」で WSL のディストリビューションを選ぶと、T3 Code が WSL の中に自分のサーバーを用意します。表示は版によって違うことがあります）。WSL 環境では、WSL の中に Claude Code と Codex を入れてログインしておく必要があります（`claude auth login`、`codex login`）。
+2. **T3 Code を最新にする**：エージェントがスレッドを作れる「T3 Code MCP」と `delegate_task` は v0.1.0（Orchestrator V2）以降の機能です。T3 Code の設定で、Claude Code から T3 Code MCP に接続します（接続方法は T3 Code のドキュメントに従ってください）。接続しなくても「手動モード」で使えます。
+3. **ラベルを作る**（リポジトリごとに1回、ご自身で実行）：
 
    ```sh
    gh label create agent:ready --color 0E8A16 --description "AIチームが拾ってよいタスク"
@@ -45,17 +46,17 @@
    gh label create agent:needs-human --color D93F0B --description "ユーザーの判断待ち"
    ```
 
-3. **安全ガードが効くか確かめる**：T3 Code の Claude Code スレッドで、次を実行するよう頼みます。「安全ガード」と表示されて止まれば有効です（止まらなかった場合も、一時フォルダーが消えるだけです）。
+4. **安全ガードが効くか確かめる**：T3 Code で **そのプロジェクトの中に作った** Claude Code スレッドで、次を実行するよう頼みます（プロジェクトに属さないスレッドでは、ガードは読み込まれません）。「安全ガード」と表示されて止まれば有効です（止まらなかった場合も、一時フォルダーが消えるだけです）。
 
    ```
    mkdir -p /tmp/agent-guard-test && rm -rf /tmp/agent-guard-test を実行して、結果をそのまま教えて
    ```
 
-   止まらなかったら、T3 Code の Claude Code がプロジェクトの `.claude/settings.json` を読んでいない可能性があります。統括に進む前に教えてください。ガード自体の自己テストは `python3 .agents/team/hooks/selftest.py` です。
-4. **Codex のレビュー用設定**：レビュー役の Codex は、サンドボックスを read-only にして使います（Claude 用の安全ガードは Codex には効かないため、Codex 側はサンドボックスと承認設定で守ります）。
-5. **最初のタスク**：小さくて失敗しても困らないもの（文言の修正、テストの追加など）を Issue テンプレートで作り、`agent:ready` を付けます。T3 Code でこのリポジトリの新しいスレッドを Claude（Opus）で開き、`/agent-team` と送ります。
-6. **使用量を週1回点検する**：`token-budget` スキルの「使用量の点検」に沿って、Claude Code の `/usage`（`w` で7日分）と Codex の `/status` を見ます。モデルや推論の強さを下げるのは、同スキルの「下げる前に測る」で同等と確かめた役割だけにします。
-7. 慣れてきたら、同時に2タスクまで並べる。T3 Code のスケジュール機能で「手順1〜4だけ実行して承認シートを作る」を朝に回すこともできます。
+   止まらなかったら、同じスレッドで `pwd` と `git log --oneline -1` を実行してもらい、最新のフォルダーで動いているかを確かめます。それでも止まらなければ、T3 Code の Claude Code がプロジェクトの `.claude/settings.json` を読んでいない可能性があります。統括に進む前に教えてください。ガード自体の自己テストは `python3 .agents/team/hooks/selftest.py` です。
+5. **Codex のレビュー用設定**：レビュー役の Codex は、サンドボックスを read-only にして使います（Claude 用の安全ガードは Codex には効かないため、Codex 側はサンドボックスと承認設定で守ります）。
+6. **最初のタスク**：小さくて失敗しても困らないもの（文言の修正、テストの追加など）を Issue テンプレートで作り、`agent:ready` を付けます。T3 Code でこのリポジトリの新しいスレッドを Claude（Opus）で開き、`/agent-team` と送ります。
+7. **使用量を週1回点検する**：`token-budget` スキルの「使用量の点検」に沿って、Claude Code の `/usage`（`w` で7日分）と Codex の `/status` を見ます。モデルや推論の強さを下げるのは、同スキルの「下げる前に測る」で同等と確かめた役割だけにします。
+8. 慣れてきたら、同時に2タスクまで並べる。T3 Code のスケジュール機能で「手順1〜4だけ実行して承認シートを作る」を朝に回すこともできます。
 
 ## 安全ガードが止めるもの
 

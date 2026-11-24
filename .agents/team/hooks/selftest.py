@@ -138,6 +138,43 @@ def run(tool, tool_input):
     return proc.returncode
 
 
+WRAPPER = GUARD.with_name("run-guard.sh")
+
+
+def run_wrapper(command, env=None):
+    """settings.json と同じ形（bash run-guard.sh || exit 2）で入口を起動する。"""
+    proc = subprocess.run(
+        ["bash", "-c", f'bash "{WRAPPER}" || exit 2'],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}),
+        capture_output=True, text=True, env=env,
+    )
+    return proc.returncode
+
+
+def wrapper_checks():
+    import os
+    failures = []
+    if run_wrapper("rm -rf build") != 2:
+        failures.append("入口経由で、止まるべきなのに通った: rm -rf build")
+    if run_wrapper("git status") != 0:
+        failures.append("入口経由で、通るべきなのに止まった: git status")
+    # Python が見つからない環境（Windows の Store 版 python3 だけ、など）では止まること
+    no_python = dict(os.environ, PATH="/nonexistent")
+    proc = subprocess.run(
+        ["/bin/bash", "-c", f'/bin/bash "{WRAPPER}" || exit 2'],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}),
+        capture_output=True, text=True, env=no_python,
+    )
+    if proc.returncode != 2:
+        failures.append("Python が見つからないのに止まらなかった")
+    # 入口のファイルがない場合も止まること（settings.json の || exit 2）
+    proc = subprocess.run(["bash", "-c", 'bash "/nonexistent/run-guard.sh" || exit 2'],
+                          input="{}", capture_output=True, text=True)
+    if proc.returncode != 2:
+        failures.append("入口のファイルがないのに止まらなかった")
+    return failures, 4
+
+
 def main():
     failures = []
     for cmd in BLOCK_BASH:
@@ -152,7 +189,9 @@ def main():
     for tool, ti in ALLOW_FILES:
         if run(tool, ti) != 0:
             failures.append(f"通るべきなのに止まった: {tool} {ti}")
-    total = len(BLOCK_BASH) + len(ALLOW_BASH) + len(BLOCK_FILES) + len(ALLOW_FILES)
+    wrapper_failures, wrapper_total = wrapper_checks()
+    failures += wrapper_failures
+    total = len(BLOCK_BASH) + len(ALLOW_BASH) + len(BLOCK_FILES) + len(ALLOW_FILES) + wrapper_total
     if failures:
         print("\n".join(failures))
         print(f"失敗 {len(failures)} / {total}")
