@@ -4,6 +4,13 @@
 `time_utils.py`は時刻変換を担当する。機械学習モデルやAPIからは、ファイルI/Oなしで
 `audit_dataframe(data)`を利用できる。
 
+## AI開発チーム
+
+開発の一部は、AIチーム（agent-team）で`agent:ready`の付いたIssueごとに進める。
+Claudeが実装計画の作成と実装、Codexが読み取り専用の環境での独立したレビューを担当し、
+ユーザーがプランの承認、レビュー指摘の取捨、マージの判断を行う。
+利用手順は[AIチームの使い方](.agents/team/README.md)を参照。
+
 ## テスト
 
 既存の仮想環境を使う。
