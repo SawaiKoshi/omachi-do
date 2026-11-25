@@ -289,6 +289,39 @@ for (const operation of ['post', 'lookup']) {
   });
 }
 
+// #14: the foundation itself refuses a different reception while one is
+// unresolved, independent of the UI's own busy flag.
+for (const stage of ['post', 'unknown']) {
+  test(`a different reception cannot prepare while another one's ${stage === 'post' ? 'POST is in flight' : 'result is unknown'}`, async t => {
+    const gate = deferred(), entered = deferred();
+    const h = harness(t, { post: stage === 'post'
+      ? async () => { entered.resolve(); return gate.promise; }
+      : () => { throw Error('lost'); } });
+    let pending;
+    if (stage === 'post') { pending = h.execute(); await entered.promise; }
+    else assert.equal(await h.execute(), false);
+    const record = h.client.status().journal.record, stored = [...h.storage.values], ids = h.issuedIds();
+    assert.ok(record.operation_id);
+    for (let i = 0; i < 3; i++) {
+      for (const action of ['call', 'absent']) {
+        const ticket = await h.client.prepare(action, OTHER);
+        assert.equal(ticket, null);
+        assert.equal(await h.client.confirm(ticket), false);
+      }
+    }
+    assert.deepEqual(h.requests.filter(r => r.url.includes(OTHER)).map(r => r.url), []);
+    assert.equal(h.posts().length, 1);
+    assert.equal(h.posts()[0].url, `/staff/receptions/${ID}/operations`);
+    assert.equal(h.issuedIds(), ids);
+    assert.deepEqual(h.client.status().journal.record, record);
+    assert.deepEqual([...h.storage.values], stored);
+    if (stage === 'post') { gate.resolve(response([...h.ledger.values()][0])); assert.equal(await pending, true); }
+    else assert.equal(await h.client.lookup(), true);
+    assert.equal(h.client.status().journal.kind, 'empty');
+    assert.equal(h.posts().length, 1);
+  });
+}
+
 for (const elapsed of [OPERATION_RECOVERY_MS, -1]) {
   test(`expired or reversed clock (${elapsed}) retains a queryable manual marker`, async t => {
     const h = harness(t, { post: () => { throw Error('lost'); } }); await h.execute();

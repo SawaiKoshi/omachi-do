@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { createStaffApp } from '../../web/staff/assets/staff.mjs';
 import { createCallJournal, CALL_JOURNAL_KEY, CALL_RECOVERY_MS } from '../../web/staff/assets/staff-call-journal.mjs';
 import { validCallReceipt } from '../../web/staff/assets/staff-call.mjs';
-import { createOperationJournal, OPERATION_JOURNAL_KEY, OPERATION_RECOVERY_MS } from '../../web/staff/assets/staff-operation-journal.mjs';
+import { createOperationJournal, OPERATION_JOURNAL_KEY, OPERATION_JOURNAL_GUARD_KEY, OPERATION_RECOVERY_MS } from '../../web/staff/assets/staff-operation-journal.mjs';
 
 // The browser suite deliberately provides no real browser storage, cookies, DB,
 // credentials, or network. All receipts and session responses are synthetic.
@@ -3161,6 +3161,136 @@ for (const [port, action, factory] of [
       h.controller.stop();
     });
   }
+}
+
+// #14: while reception A's operation waits on the network (context or POST) or
+// is result-unknown, a different reception B can neither start, contact the
+// server, issue an operation ID nor overwrite A's recovery data. Progress is
+// controlled by deferred promises and the fake clock only.
+for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'],
+  [8446, 'context'], [8446, 'post'], [8446, 'unknown']]) {
+  const waiting = stage === 'unknown' ? 'result-unknown' : `waiting on its ${stage === 'post' ? 'POST' : 'operation-context'}`;
+  test(`${port} reception B cannot start while reception A is ${waiting}, and B works after A settles`, async () => {
+    const seatLab = port === 8446, word = { call: '呼出', absent: '不在', seat: '案内完了' };
+    const actionA = seatLab ? 'seat' : 'call', actionB = seatLab ? 'seat' : 'absent';
+    const rowA = reception(1), rowB = seatLab ? reception(2) : reception(2, { status: 'called',
+      called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent', 'seat', 'cancel'] });
+    const gate = deferred(); let held = false, posted = 0;
+    const h = operationHarness({ seatLab, rows: [rowA, rowB],
+      // Hold only A's first context, so a stray B request could never hang the test.
+      context: row => {
+        if (stage !== 'context' || held || row?.id !== rowA.id) return undefined;
+        held = true; return gate.promise;
+      },
+      post: async (_body, _request, _rows, _ledger, apply) => {
+        if (posted++) return undefined;
+        if (stage === 'post') { await gate.promise; return apply(); }
+        if (stage === 'unknown') { apply(); throw Error('synthetic lost response'); }
+        return undefined;
+      } });
+    let issued = 0; h.env.crypto.randomUUID = () => { issued++; return randomUUID(); };
+    const locate = id => {
+      for (const view of ['active', 'absent', 'recent']) {
+        const item = h.el(`${view}-list`).children.find(child => child.dataset.receptionId === id);
+        if (item) return { view, item };
+      }
+      return assert.fail(`reception ${id} is not listed`);
+    };
+    const openRow = async id => {
+      const { view, item } = locate(id);
+      await h.el(`${view}-tab`).emit('click'); await rowTrigger(item).emit('click');
+      return item;
+    };
+    const buttons = () => h.el('row-menu-items').children.flatMap(item => item.children);
+    await h.start();
+
+    // B is operable before A starts; keep its button to press it later directly.
+    const itemB = await openRow(rowB.id);
+    assert.match(h.el('row-menu-title').textContent, /002番/);
+    const staleB = buttons().find(button => button.textContent === word[actionB]);
+    assert.ok(staleB, 'B offers its action while nothing is in flight');
+
+    await h.openMenu(actionA, 0);
+    assert.match(h.el('row-menu-title').textContent, /001番/);
+    const sending = h.chooseAction(); await settle();
+    if (stage === 'context') {
+      assert.equal(held, true); assert.equal(h.posts().length, 0);
+      assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null); assert.equal(issued, 0);
+    } else {
+      assert.equal(h.posts().length, 1);
+      assert.equal(h.posts()[0].url, `/staff/receptions/${rowA.id}/operations`);
+      assert.ok(h.storage.getItem(OPERATION_JOURNAL_KEY)); assert.equal(issued, 1);
+    }
+    if (stage === 'unknown') assert.match(h.el('call-status-message').textContent, /結果不明/);
+    else assert.ok(h.el('call-status-message').textContent.includes(`${rowA.display_number}の${word[actionA]}を処理中です`));
+    // A's operation ID comes from its recovery journal; the context stage has none yet.
+    const idA = stage === 'context' ? null : JSON.parse(h.storage.getItem(OPERATION_JOURNAL_KEY)).operation_id;
+    if (idA) assert.equal(JSON.parse(h.posts()[0].body).operation_id, idA);
+    const shownId = idA ? `操作ID：${idA}` : '';
+
+    const journal = h.storage.getItem(OPERATION_JOURNAL_KEY), guard = h.storage.getItem(OPERATION_JOURNAL_GUARD_KEY);
+    const stored = [...h.storage.values], message = h.el('call-status-message').textContent;
+    const posts = h.posts().length, uuids = issued, originalB = structuredClone(h.rows[1]), since = h.requests.length;
+    const attemptMenu = async () => {
+      const item = await openRow(rowB.id);
+      assert.match(h.el('row-menu-title').textContent, /002番/);
+      assert.equal(buttons().length, 0, 'B offers no executable action while A is unresolved');
+      return item;
+    };
+
+    assert.equal(await attemptMenu(), itemB);
+    // While A's POST is in flight the ID appears only at the next render, so
+    // before B is tried the display may still be blank, but never another ID.
+    assert.ok(['', shownId].includes(h.el('call-operation-id').textContent), 'only A\'s operation ID can be displayed');
+    await Promise.all([staleB.emit('click'), staleB.emit('click')]); await settle();
+    assert.equal(h.doc.activeElement, rowTrigger(itemB), 'the kept B button passed its row checks and reached execute');
+    assert.equal(h.el('call-operation-id').textContent, shownId);
+    await h.tick(5000);
+    assert.ok(h.requests.slice(since).some(r => r.url.startsWith('/staff/receptions?')), 'a background refresh ran');
+    assert.equal(await attemptMenu(), itemB, 'the unchanged B row was not redrawn');
+
+    assert.deepEqual(h.requests.slice(since).filter(r => r.url.includes('/operation')).map(r => r.url), []);
+    assert.deepEqual(h.requests.filter(r => r.url.includes(rowB.id)).map(r => r.url), []);
+    assert.equal(h.posts().length, posts); assert.equal(issued, uuids);
+    assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), journal);
+    assert.equal(h.storage.getItem(OPERATION_JOURNAL_GUARD_KEY), guard);
+    assert.deepEqual([...h.storage.values], stored);
+    assert.equal(h.el('call-operation-id').textContent, shownId);
+    assert.equal(h.el('call-status-message').textContent, message);
+    assert.deepEqual(h.rows[1], originalB);
+
+    if (stage === 'context') gate.resolve(response({ metadata: metadata(), reception: { ...rowA } }));
+    if (stage === 'post') gate.resolve();
+    await sending;
+    if (stage === 'unknown') await h.el('call-lookup').emit('click');
+    await settle(); await settle(); await settle();
+    assert.equal(h.posts().length, 1);
+    assert.equal(h.posts()[0].url, `/staff/receptions/${rowA.id}/operations`);
+    assert.equal(JSON.parse(h.posts()[0].body).action, actionA);
+    if (idA) assert.equal(JSON.parse(h.posts()[0].body).operation_id, idA);
+    assert.equal(issued, 1);
+    assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null);
+    assert.equal(h.el('call-operation-id').textContent, '');
+    assert.equal(h.rows[0].status, seatLab ? 'seated' : 'called');
+    assert.equal(locate(rowA.id).view, seatLab ? 'recent' : 'active');
+    assert.match(locate(rowA.id).item.textContent, seatLab ? /案内済み/ : /呼出中/);
+    assert.deepEqual(h.rows[1], originalB); assert.equal(locate(rowB.id).view, 'active');
+    assert.match(h.el('call-success-message').textContent, new RegExp(`${word[actionA]}成功.*最新一覧`));
+
+    await openRow(rowB.id);
+    const buttonB = buttons().find(button => button.textContent === word[actionB]);
+    assert.ok(buttonB, 'B is operable again once A has settled');
+    await buttonB.emit('click'); await settle(); await settle();
+    assert.equal(h.posts().length, 2);
+    assert.equal(h.posts()[1].url, `/staff/receptions/${rowB.id}/operations`);
+    const [first, second] = h.posts().map(p => JSON.parse(p.body));
+    assert.equal(second.action, actionB); assert.notEqual(second.operation_id, first.operation_id);
+    assert.equal(issued, 2);
+    assert.equal(h.rows[1].status, seatLab ? 'seated' : 'absent');
+    assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null);
+    assert.match(h.el('call-success-message').textContent, new RegExp(`${word[actionB]}成功.*最新一覧`));
+    h.controller.stop();
+  });
 }
 
 test('8444 a restored capability does not revive the earlier selected call', async () => {
