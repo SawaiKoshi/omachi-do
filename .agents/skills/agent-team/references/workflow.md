@@ -15,7 +15,7 @@ gh issue list --label agent:ready --state open --json number,title,labels,body -
 
 ## 2. worktree と子スレッドを作る
 
-- **T3 Code MCP がある場合**：T3 Code の worktree モードで子スレッドを作り、ブランチ名を `agent/<N>-<slug>`、起点を最新の `origin/main` にする。プロバイダーとモデルは `profile.md` の「プラン」の行に合わせる。最初のメッセージは `prompts.md` の「プラン依頼」。
+- **T3 Code MCP がある場合**：T3 Code の worktree モードで子スレッドを作り、ブランチ名を `agent/<N>-<slug>`、起点を最新の `origin/main` にする。プロバイダーとモデルは `profile.md` の「プラン」の行に合わせる。**プランモードでは起動せず、通常モードで起動する**（読むだけにすることは依頼文で指示する）。最初のメッセージは `prompts.md` の「プラン依頼」。
 - **T3 Code が worktree を作れない、または手動モードの場合**：
 
   ```sh
@@ -27,7 +27,9 @@ gh issue list --label agent:ready --state open --json number,title,labels,body -
 
 ## 3. プラン（子スレッド）
 
-子は `team-plan` スキルに従い、プランを最後のメッセージとして返して止まる。統括は子スレッドの結果を待って読む。
+子は `team-plan` スキルに従い、プランを最後のメッセージとして返して止まる。統括は子スレッドの結果を待って読む。子スレッドは通常モードなので、ファイルを変えていないことを統括が `git -C <worktree> status --short` で確かめる。
+
+承認シートには、プランの「規模」と、それに応じた実装のモデル（`profile.md` の「実装」の2行のどちらか）を書く。
 
 ## 4. 衝突を調べて承認シートを作る
 
@@ -62,9 +64,14 @@ gh issue list --label agent:ready --state open --json number,title,labels,body -
 - 差し戻し → ユーザーの言葉を原文のまま子スレッドに渡し、3をやり直す。
 - 承認されたプラン本文（判断点への答えを含む）は、実装依頼にそのまま貼る。
 
-## 6. 実装用モデルへ切り替え
+## 6. 実装の担当を決める
 
-同じ子スレッドのまま、`profile.md` の「実装」の行の推論の強さに切り替える。モデル自体（Opus など）は変えない。モデルを変えるとそれまでの会話のキャッシュが使えず、会話全体を読み直すことになるため。プロバイダーをまたぐ切り替え（Claude→Codex）はしない。T3 Code が「プロバイダーの切り替えは文脈が欠ける」としているため。Codex を使う作業は `delegate_task` で別の子スレッドとして起動する。
+承認された規模に応じて、`profile.md` の「実装」の行に合わせる。
+
+- **規模「小」（テストの追加・小さな修正）**：プランのスレッドは切り替えず、そのまま残す。`delegate_task` などで Sonnet の実装用の新しい子スレッドを、同じ worktree で起動する。プランを書いたスレッドの会話は引き継がれないので、`prompts.md` の「実装依頼」に作業場所・Issue・承認されたプランの全文・ユーザーの答え（原文）を書く。
+- **規模「中」「大」**：同じ子スレッドのまま、推論の強さを切り替える。以下はこの場合の理由。
+
+同じスレッドで続けるときは、モデル自体（Opus など）は変えない。モデルを変えるとそれまでの会話のキャッシュが使えず、会話全体を読み直すことになるため。プロバイダーをまたぐ切り替え（Claude→Codex）はしない。T3 Code が「プロバイダーの切り替えは文脈が欠ける」としているため。Codex を使う作業は `delegate_task` で別の子スレッドとして起動する。
 
 ## 7. 実装（子スレッド）
 
@@ -73,7 +80,7 @@ gh issue list --label agent:ready --state open --json number,title,labels,body -
 ## 8. レビュー（Codex の子スレッド）
 
 - `delegate_task` などで Codex の子スレッドを**同じ worktree**、読むだけの設定（サンドボックスは read-only）で起動し、`prompts.md` の「レビュー依頼」を送る。
-- Codex が使えないとき（上限・障害）：Claude の別スレッドに `team-review` を実行させ、レビュー担当が Claude だったことを PR 本文に書く。実装したスレッドに自分のレビューはさせない。
+- Codex が使えないとき（上限・障害）：Claude Opus（high）の別スレッドに `team-review` を実行させ、レビュー担当が Claude だったことを PR 本文に書く。実装したスレッドに自分のレビューはさせない。
 
 ## 9. ★指摘の取捨
 
