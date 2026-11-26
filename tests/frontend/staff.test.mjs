@@ -3167,9 +3167,13 @@ for (const [port, action, factory] of [
 // is result-unknown, a different reception B can neither start, contact the
 // server, issue an operation ID nor overwrite A's recovery data. Progress is
 // controlled by deferred promises and the fake clock only.
-for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'],
-  [8446, 'context'], [8446, 'post'], [8446, 'unknown']]) {
-  const waiting = stage === 'unknown' ? 'result-unknown' : `waiting on its ${stage === 'post' ? 'POST' : 'operation-context'}`;
+// The 'refresh' stage holds the list refresh after A's successful POST: the
+// journal is already empty and the engine idle, so only the UI busy flag
+// (staff-operation-ui.mjs canStart/run) stands between B and a new operation.
+for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'], [8445, 'refresh'],
+  [8446, 'context'], [8446, 'post'], [8446, 'unknown'], [8446, 'refresh']]) {
+  const waiting = stage === 'unknown' ? 'result-unknown'
+    : `waiting on its ${{ context: 'operation-context', post: 'POST', refresh: 'list refresh after a successful POST' }[stage]}`;
   test(`${port} reception B cannot start while reception A is ${waiting}, and B works after A settles`, async () => {
     const seatLab = port === 8446, word = { call: '呼出', absent: '不在', seat: '案内完了' };
     const actionA = seatLab ? 'seat' : 'call', actionB = seatLab ? 'seat' : 'absent';
@@ -3177,6 +3181,12 @@ for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'
       called_at: '2026-11-01T18:05:00+09:00', allowed_actions: ['absent', 'seat', 'cancel'] });
     const gate = deferred(); let held = false, posted = 0;
     const h = operationHarness({ seatLab, rows: [rowA, rowB],
+      // Hold only the first list read after A's POST; other reads (background
+      // polling) fall through to the synthetic listing.
+      fetch: async url => {
+        if (stage !== 'refresh' || held || !posted || !url.startsWith('/staff/receptions?')) return undefined;
+        held = true; await gate.promise; return undefined;
+      },
       // Hold only A's first context, so a stray B request could never hang the test.
       context: row => {
         if (stage !== 'context' || held || row?.id !== rowA.id) return undefined;
@@ -3213,18 +3223,27 @@ for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'
     await h.openMenu(actionA, 0);
     assert.match(h.el('row-menu-title').textContent, /001番/);
     const sending = h.chooseAction(); await settle();
+    // The list refresh starts only after the POST receipt and current context
+    // are verified; flush microtasks (bounded, no real time) until it is held.
+    for (let i = 0; stage === 'refresh' && !held && i < 20; i++) await settle();
     if (stage === 'context') {
       assert.equal(held, true); assert.equal(h.posts().length, 0);
       assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null); assert.equal(issued, 0);
     } else {
       assert.equal(h.posts().length, 1);
       assert.equal(h.posts()[0].url, `/staff/receptions/${rowA.id}/operations`);
-      assert.ok(h.storage.getItem(OPERATION_JOURNAL_KEY)); assert.equal(issued, 1);
+      assert.equal(issued, 1);
+      if (stage === 'refresh') {
+        // A is confirmed (journal resolved) but the UI is still awaiting its list refresh.
+        assert.equal(held, true); assert.equal(h.storage.getItem(OPERATION_JOURNAL_KEY), null);
+        assert.equal(h.rows[0].status, seatLab ? 'seated' : 'called');
+      } else assert.ok(h.storage.getItem(OPERATION_JOURNAL_KEY));
     }
     if (stage === 'unknown') assert.match(h.el('call-status-message').textContent, /結果不明/);
     else assert.ok(h.el('call-status-message').textContent.includes(`${rowA.display_number}の${word[actionA]}を処理中です`));
-    // A's operation ID comes from its recovery journal; the context stage has none yet.
-    const idA = stage === 'context' ? null : JSON.parse(h.storage.getItem(OPERATION_JOURNAL_KEY)).operation_id;
+    // A's operation ID comes from its recovery journal; the context stage has none
+    // yet and the refresh stage has already resolved it.
+    const idA = ['context', 'refresh'].includes(stage) ? null : JSON.parse(h.storage.getItem(OPERATION_JOURNAL_KEY)).operation_id;
     if (idA) assert.equal(JSON.parse(h.posts()[0].body).operation_id, idA);
     const shownId = idA ? `操作ID：${idA}` : '';
 
@@ -3241,12 +3260,20 @@ for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'
     assert.equal(await attemptMenu(), itemB);
     // While A's POST is in flight the ID appears only at the next render, so
     // before B is tried the display may still be blank, but never another ID.
-    assert.ok(['', shownId].includes(h.el('call-operation-id').textContent), 'only A\'s operation ID can be displayed');
+    // In every other stage it must already be exact.
+    assert.ok((stage === 'post' ? ['', shownId] : [shownId]).includes(h.el('call-operation-id').textContent),
+      'only A\'s operation ID can be displayed');
     await Promise.all([staleB.emit('click'), staleB.emit('click')]); await settle();
     assert.equal(h.doc.activeElement, rowTrigger(itemB), 'the kept B button passed its row checks and reached execute');
+    // Depends on the current render timing: the rejected B click re-renders via
+    // run()'s early render(), which is what shows A's ID in the 'post' stage.
     assert.equal(h.el('call-operation-id').textContent, shownId);
     await h.tick(5000);
-    assert.ok(h.requests.slice(since).some(r => r.url.startsWith('/staff/receptions?')), 'a background refresh ran');
+    const listReads = () => h.requests.slice(since).filter(r => r.url.startsWith('/staff/receptions?')).length;
+    // staff.mjs stops polling while a list refresh is in flight (abortReads clears
+    // the poll timer; it is rescheduled only when that refresh finishes).
+    if (stage === 'refresh') assert.equal(listReads(), 0, 'no background list read while A\'s refresh is held');
+    else assert.ok(listReads() > 0, 'a background refresh ran');
     assert.equal(await attemptMenu(), itemB, 'the unchanged B row was not redrawn');
 
     assert.deepEqual(h.requests.slice(since).filter(r => r.url.includes('/operation')).map(r => r.url), []);
@@ -3256,11 +3283,14 @@ for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'
     assert.equal(h.storage.getItem(OPERATION_JOURNAL_GUARD_KEY), guard);
     assert.deepEqual([...h.storage.values], stored);
     assert.equal(h.el('call-operation-id').textContent, shownId);
-    assert.equal(h.el('call-status-message').textContent, message);
+    // In the 'refresh' stage A's own "confirmed, list unverified" message was set
+    // without a render; the rejected B click renders it (current render timing).
+    assert.equal(h.el('call-status-message').textContent, stage === 'refresh'
+      ? '操作結果は確定していますが、最新一覧は未確認です。操作をやり直さず「最新情報を取得」で確認してください。' : message);
     assert.deepEqual(h.rows[1], originalB);
 
     if (stage === 'context') gate.resolve(response({ metadata: metadata(), reception: { ...rowA } }));
-    if (stage === 'post') gate.resolve();
+    if (['post', 'refresh'].includes(stage)) gate.resolve();
     await sending;
     if (stage === 'unknown') await h.el('call-lookup').emit('click');
     await settle(); await settle(); await settle();
@@ -3276,6 +3306,12 @@ for (const [port, stage] of [[8445, 'context'], [8445, 'post'], [8445, 'unknown'
     assert.match(locate(rowA.id).item.textContent, seatLab ? /案内済み/ : /呼出中/);
     assert.deepEqual(h.rows[1], originalB); assert.equal(locate(rowB.id).view, 'active');
     assert.match(h.el('call-success-message').textContent, new RegExp(`${word[actionA]}成功.*最新一覧`));
+    if (stage === 'refresh') {
+      // Once A's refresh has completed, periodic polling resumes (fake clock only).
+      const reads = h.requests.filter(r => r.url.startsWith('/staff/receptions?')).length;
+      await h.tick(5000);
+      assert.ok(h.requests.filter(r => r.url.startsWith('/staff/receptions?')).length > reads, 'polling resumed after A\'s refresh');
+    }
 
     await openRow(rowB.id);
     const buttonB = buttons().find(button => button.textContent === word[actionB]);

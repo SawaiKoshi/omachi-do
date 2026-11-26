@@ -290,32 +290,46 @@ for (const operation of ['post', 'lookup']) {
 }
 
 // #14: the foundation itself refuses a different reception while one is
-// unresolved, independent of the UI's own busy flag.
-for (const stage of ['post', 'unknown']) {
-  test(`a different reception cannot prepare while another one's ${stage === 'post' ? 'POST is in flight' : 'result is unknown'}`, async t => {
+// unresolved, independent of the UI's own busy flag. The 'context' stage holds
+// A's first operation-context: the journal is still empty, so only the
+// engine's busy flag (staff-operations.mjs prepare) refuses OTHER.
+for (const stage of ['context', 'post', 'unknown']) {
+  const title = { context: 'first operation-context is in flight', post: 'POST is in flight', unknown: 'result is unknown' }[stage];
+  test(`a different reception cannot prepare while another one's ${title}`, async t => {
     const gate = deferred(), entered = deferred();
-    const h = harness(t, { post: stage === 'post'
-      ? async () => { entered.resolve(); return gate.promise; }
-      : () => { throw Error('lost'); } });
+    const h = harness(t, {
+      context: stage === 'context' ? async n => { if (n !== 1) return undefined; entered.resolve(); return gate.promise; } : undefined,
+      post: stage === 'post' ? async () => { entered.resolve(); return gate.promise; }
+        : stage === 'unknown' ? () => { throw Error('lost'); } : undefined });
     let pending;
-    if (stage === 'post') { pending = h.execute(); await entered.promise; }
-    else assert.equal(await h.execute(), false);
-    const record = h.client.status().journal.record, stored = [...h.storage.values], ids = h.issuedIds();
-    assert.ok(record.operation_id);
+    if (stage === 'unknown') assert.equal(await h.execute(), false);
+    else { pending = h.execute(); await entered.promise; }
+    const journal = h.client.status().journal, stored = [...h.storage.values], ids = h.issuedIds();
+    if (stage === 'context') {
+      assert.equal(journal.kind, 'empty'); assert.equal(h.client.status().busy, true);
+      assert.equal(h.posts().length, 0); assert.equal(ids, 0);
+    } else {
+      assert.ok(journal.record.operation_id);
+      assert.equal(h.posts().length, 1);
+      assert.equal(h.posts()[0].url, `/staff/receptions/${ID}/operations`);
+    }
     for (let i = 0; i < 3; i++) {
       for (const action of ['call', 'absent']) {
         const ticket = await h.client.prepare(action, OTHER);
         assert.equal(ticket, null);
+        // Not a separate guard check: a null ticket is always refused by
+        // confirm()'s own `!ticket` test. It only pins that the refused
+        // prepare leaves nothing a caller could still confirm.
         assert.equal(await h.client.confirm(ticket), false);
       }
     }
     assert.deepEqual(h.requests.filter(r => r.url.includes(OTHER)).map(r => r.url), []);
-    assert.equal(h.posts().length, 1);
-    assert.equal(h.posts()[0].url, `/staff/receptions/${ID}/operations`);
+    assert.equal(h.posts().length, stage === 'context' ? 0 : 1);
     assert.equal(h.issuedIds(), ids);
-    assert.deepEqual(h.client.status().journal.record, record);
+    assert.deepEqual(h.client.status().journal, journal);
     assert.deepEqual([...h.storage.values], stored);
-    if (stage === 'post') { gate.resolve(response([...h.ledger.values()][0])); assert.equal(await pending, true); }
+    if (stage === 'context') { gate.resolve(response(h.data)); assert.equal(await pending, true); }
+    else if (stage === 'post') { gate.resolve(response([...h.ledger.values()][0])); assert.equal(await pending, true); }
     else assert.equal(await h.client.lookup(), true);
     assert.equal(h.client.status().journal.kind, 'empty');
     assert.equal(h.posts().length, 1);
